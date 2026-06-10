@@ -1,0 +1,30 @@
+# Dependencies and build artifacts
+deps/
+_build/
+.elixir_ls/
+
+# Node modules
+assets/node_modules/
+
+# Local env files
+.env
+.env.*
+
+# Test files
+test/
+
+# Git
+.git/
+.gitignore
+
+# Docs
+README.md
+CHANGELOG.md
+
+# Editor
+.vscode/
+.idea/
+
+# Docker
+Dockerfile
+.dockerignore
