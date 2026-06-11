@@ -1,7 +1,10 @@
 # =============================================================================
 # Stage 1 — Dependencies
+# Elixir 1.20.0 / OTP 29 / Alpine (latest as of June 2026)
+# Using same base image in ALL stages — guarantees identical OpenSSL version
+# across build and runtime — prevents crypto.so symbol mismatch
 # =============================================================================
-FROM elixir:1.17-otp-27-alpine AS deps
+FROM elixir:1.20.0-otp-29-alpine AS deps
 
 RUN apk add --no-cache \
     build-base \
@@ -15,6 +18,8 @@ WORKDIR /app
 RUN mix local.hex --force && \
     mix local.rebar --force
 
+# Copy dependency files first — layer cache means deps only
+# reinstall when mix.exs or mix.lock changes
 COPY mix.exs mix.lock ./
 RUN mix deps.get --only prod
 
@@ -24,25 +29,20 @@ RUN mix deps.compile
 # =============================================================================
 # Stage 2 — Compile Application
 # Must happen BEFORE assets.deploy so Mix.Project.build_path() is populated
-# esbuild NODE_PATH needs compiled artifacts to resolve phoenix-colocated
+# esbuild NODE_PATH needs _build/ to resolve phoenix-colocated/mangocms
 # =============================================================================
 FROM deps AS builder
 
-# Copy runtime config
 COPY config/runtime.exs ./config/
-
-# Copy application source
 COPY lib ./lib
 COPY priv ./priv
 
-# Compile application — populates _build/
-# This makes Mix.Project.build_path() resolvable for esbuild
 RUN mix compile
 
 # =============================================================================
 # Stage 3 — Assets
-# Now esbuild can resolve phoenix-colocated/mangocms via NODE_PATH
-# because _build/ is populated from Stage 2
+# Tailwind v4 + esbuild via standalone binaries
+# phoenix-colocated resolves from _build/ via NODE_PATH in config/config.exs
 # =============================================================================
 FROM builder AS assets
 
@@ -51,8 +51,6 @@ COPY assets ./assets
 RUN mix tailwind.install --if-missing && \
     mix esbuild.install --if-missing
 
-# esbuild resolves phoenix-colocated via:
-# NODE_PATH = ../deps + Mix.Project.build_path() (_build/prod)
 RUN mix assets.deploy
 
 # =============================================================================
@@ -64,23 +62,29 @@ RUN mix release
 
 # =============================================================================
 # Stage 5 — Production Runtime
-# Minimal Alpine — compiled binary only
+# SAME base image as build stages — identical OpenSSL — no crypto.so mismatch
+# Strip out mix/hex/build tools — keep only the compiled release binary
 # =============================================================================
-FROM alpine:3.20 AS runtime
+FROM elixir:1.20.0-otp-29-alpine AS runtime
 
+# Remove build tools — not needed at runtime
+RUN apk del --no-cache \
+    build-base 2>/dev/null || true
+
+# Add only what runtime needs
 RUN apk add --no-cache \
-    libstdc++ \
-    libgcc \
-    ncurses-libs \
+    bash \
     openssl \
     ca-certificates \
-    bash
+    ncurses-libs
 
+# Create non-root user
 RUN addgroup -g 1000 appgroup && \
     adduser -u 1000 -G appgroup -s /bin/sh -D appuser
 
 WORKDIR /app
 
+# Copy only the compiled release — no source, no mix, no hex
 COPY --from=release --chown=appuser:appgroup \
     /app/_build/prod/rel/mangocms ./
 
