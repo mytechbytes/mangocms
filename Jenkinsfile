@@ -15,7 +15,7 @@ pipeline {
         string(
             name: 'COVERAGE_THRESHOLD',
             defaultValue: '80',
-            description: 'Minimum test coverage % required to proceed. Default: 80'
+            description: 'Minimum test coverage % required to proceed.'
         )
     }
 
@@ -37,27 +37,31 @@ pipeline {
         IMAGE_VERSIONED = "${REGISTRY}/${OCI_NAMESPACE}/${IMAGE_NAME}:build-${env.BUILD_NUMBER}"
         IMAGE_LATEST    = "${REGISTRY}/${OCI_NAMESPACE}/${IMAGE_NAME}:latest"
 
-        // ── Elixir ────────────────────────────────────────────────────────────
-        MIX_ENV         = 'test'
-        HEX_HOME        = "${WORKSPACE}/.hex"
-        MIX_HOME        = "${WORKSPACE}/.mix"
+        // ── Elixir Docker Image — matches Dockerfile exactly ──────────────────
+        ELIXIR_IMAGE    = 'elixir:1.20.0-otp-29-alpine'
+
+        // ── Docker run flags for Elixir stages ────────────────────────────────
+        // Mounts workspace into container so mix can read source files
+        // Caches deps and _build across builds for speed
+        DOCKER_RUN = """docker run --rm \
+            -v ${WORKSPACE}:/app \
+            -v mangocms-deps:/app/deps \
+            -v mangocms-build:/app/_build \
+            -v mangocms-hex:/root/.hex \
+            -v mangocms-mix:/root/.mix \
+            -w /app \
+            -e MIX_ENV=test \
+            -e DATABASE_URL=ecto://postgres:postgres@postgres-ci/mangocms_test \
+            -e SECRET_KEY_BASE=ci_secret_key_base_min_64_chars_xxxxxxxxxxxxxxxxxxxxxxxx \
+            --network mangocms-ci \
+            ${ELIXIR_IMAGE}"""
     }
 
     options {
-        // Keep last 10 builds only — prevents disk bloat on CI
         buildDiscarder(logRotator(numToKeepStr: '10'))
-
-        // Abort if pipeline runs longer than 30 minutes
         timeout(time: 30, unit: 'MINUTES')
-
-        // Prevent concurrent builds on same job — avoids race conditions
         disableConcurrentBuilds()
-
-        // Add timestamps to all console output
         timestamps()
-
-        // Color ANSI output in Jenkins console
-        ansiColor('xterm')
     }
 
     stages {
@@ -76,38 +80,79 @@ pipeline {
 
                 sh '''
                     echo "╔══════════════════════════════════════════════╗"
-                    echo "  Job        : ${JOB_NAME}"
-                    echo "  Action     : ${PIPELINE_ACTION}"
-                    echo "  Build No   : ${BUILD_NUMBER}"
-                    echo "  Build Tag  : ${BUILD_TAG}"
-                    echo "  Commit     : $(git rev-parse --short HEAD)"
-                    echo "  Branch     : $(git rev-parse --abbrev-ref HEAD)"
-                    echo "  Author     : $(git log -1 --pretty=format:'%an')"
-                    echo "  Message    : $(git log -1 --pretty=format:'%s')"
+                    echo "  Job     : ${JOB_NAME}"
+                    echo "  Action  : ${PIPELINE_ACTION}"
+                    echo "  Build   : #${BUILD_NUMBER} (${BUILD_TAG})"
+                    echo "  Commit  : $(git rev-parse --short HEAD)"
+                    echo "  Author  : $(git log -1 --pretty=format:'%an')"
+                    echo "  Message : $(git log -1 --pretty=format:'%s')"
                     echo "╚══════════════════════════════════════════════╝"
                 '''
             }
         }
 
-        // ── Stage 2: Setup Dependencies ───────────────────────────────────────
+        // ── Stage 2: CI Infrastructure ────────────────────────────────────────
+        // Spin up postgres for tests — torn down in post
+        stage('CI Infrastructure') {
+            when {
+                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+            }
+            steps {
+                sh '''
+                    echo "── Creating CI Docker network ──"
+                    docker network create mangocms-ci 2>/dev/null || true
+
+                    echo "── Starting test database ──"
+                    docker run -d \
+                        --name mangocms-postgres-ci \
+                        --network mangocms-ci \
+                        -e POSTGRES_USER=postgres \
+                        -e POSTGRES_PASSWORD=postgres \
+                        -e POSTGRES_DB=mangocms_test \
+                        postgres:16-alpine
+
+                    echo "── Waiting for postgres to be ready ──"
+                    for i in $(seq 1 30); do
+                        docker exec mangocms-postgres-ci \
+                            pg_isready -U postgres > /dev/null 2>&1 && \
+                            echo "✓ Postgres ready after ${i}s" && break
+                        sleep 1
+                    done
+                '''
+            }
+        }
+
+        // ── Stage 3: Setup Dependencies ───────────────────────────────────────
         stage('Setup') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             steps {
                 sh '''
-                    echo "── Installing Hex and Rebar ──"
-                    mix local.hex --force --if-missing
-                    mix local.rebar --force --if-missing
+                    echo "── Installing Hex + Rebar ──"
+                    ${DOCKER_RUN} sh -c "
+                        mix local.hex --force --if-missing &&
+                        mix local.rebar --force --if-missing &&
+                        echo '✓ Hex and Rebar installed'
+                    "
 
                     echo "── Fetching dependencies ──"
-                    mix deps.get
+                    ${DOCKER_RUN} sh -c "
+                        mix deps.get &&
+                        echo '✓ Dependencies fetched'
+                    "
+
+                    echo "── Setting up test database ──"
+                    ${DOCKER_RUN} sh -c "
+                        mix ecto.create &&
+                        mix ecto.migrate &&
+                        echo '✓ Database ready'
+                    "
                 '''
             }
         }
 
-        // ── Stage 3: Parallel Quality Checks ─────────────────────────────────
-        // Compile, Credo, and Dialyzer run in parallel — saves time
+        // ── Stage 4: Parallel Quality Checks ─────────────────────────────────
         stage('Quality Checks') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
@@ -117,8 +162,11 @@ pipeline {
                 stage('Compile') {
                     steps {
                         sh '''
-                            echo "── Compiling (test env) ──"
-                            MIX_ENV=test mix compile --warnings-as-errors
+                            echo "── Compiling (warnings as errors) ──"
+                            ${DOCKER_RUN} sh -c "
+                                mix compile --warnings-as-errors &&
+                                echo '✓ Compile passed'
+                            "
                         '''
                     }
                 }
@@ -126,8 +174,11 @@ pipeline {
                 stage('Credo') {
                     steps {
                         sh '''
-                            echo "── Running Credo (strict mode) ──"
-                            MIX_ENV=test mix credo --strict
+                            echo "── Running Credo strict ──"
+                            ${DOCKER_RUN} sh -c "
+                                mix credo --strict &&
+                                echo '✓ Credo passed'
+                            "
                         '''
                     }
                 }
@@ -136,15 +187,17 @@ pipeline {
                     steps {
                         sh '''
                             echo "── Running Dialyzer ──"
-                            echo "── (PLT build on first run — cached after) ──"
-                            MIX_ENV=test mix dialyzer --format short
+                            ${DOCKER_RUN} sh -c "
+                                mix dialyzer --format short &&
+                                echo '✓ Dialyzer passed'
+                            "
                         '''
                     }
                 }
             }
         }
 
-        // ── Stage 4: Tests + Coverage ─────────────────────────────────────────
+        // ── Stage 5: Tests & Coverage ─────────────────────────────────────────
         stage('Tests & Coverage') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
@@ -152,23 +205,26 @@ pipeline {
             steps {
                 sh '''
                     echo "── Running ExUnit with coverage ──"
-                    MIX_ENV=test mix coveralls.json \
-                        --exclude wip \
-                        --trace
+                    ${DOCKER_RUN} sh -c "
+                        mix coveralls.json --exclude wip &&
+                        echo '✓ Tests passed'
+                    "
 
                     echo "── Checking coverage threshold ──"
                     COVERAGE=$(cat cover/excoveralls.json \
-                        | grep -o '"total":[0-9.]*' \
+                        | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d['stats']['total_percent'])
+" 2>/dev/null || \
+                        grep -o '"total_percent":[0-9.]*' cover/excoveralls.json \
                         | grep -o '[0-9.]*$')
 
                     echo "  Coverage        : ${COVERAGE}%"
                     echo "  Required minimum: ${COVERAGE_THRESHOLD}%"
 
-                    # Fail pipeline if below threshold
                     if [ $(echo "$COVERAGE < ${COVERAGE_THRESHOLD}" | bc -l) -eq 1 ]; then
-                        echo "✗ COVERAGE BELOW THRESHOLD — pipeline aborted"
-                        echo "  Got      : ${COVERAGE}%"
-                        echo "  Required : ${COVERAGE_THRESHOLD}%"
+                        echo "✗ Coverage ${COVERAGE}% below threshold ${COVERAGE_THRESHOLD}%"
                         exit 1
                     fi
 
@@ -177,13 +233,13 @@ pipeline {
             }
             post {
                 always {
-                    // Archive coverage report as Jenkins artifact
-                    archiveArtifacts artifacts: 'cover/**/*', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'cover/**/*',
+                        allowEmptyArchive: true
                 }
             }
         }
 
-        // ── Stage 5: Build & Push ─────────────────────────────────────────────
+        // ── Stage 6: Build & Push ─────────────────────────────────────────────
         stage('Build & Push') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
@@ -202,10 +258,6 @@ pipeline {
                             -u "$OCIR_USER" --password-stdin
 
                         echo "── Building ARM64 image ──"
-                        echo "  Tags:"
-                        echo "    ${IMAGE_VERSIONED}"
-                        echo "    ${IMAGE_LATEST}"
-
                         docker buildx build \
                             --platform linux/arm64 \
                             --no-cache \
@@ -218,16 +270,14 @@ pipeline {
                             --push \
                             .
 
-                        echo "── Logout ──"
                         docker logout ${REGISTRY}
-
-                        echo "✓ Image pushed successfully"
+                        echo "✓ Image pushed: ${IMAGE_VERSIONED}"
                     '''
                 }
             }
         }
 
-        // ── Stage 6: Deploy ───────────────────────────────────────────────────
+        // ── Stage 7: Deploy ───────────────────────────────────────────────────
         stage('Deploy') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
@@ -240,47 +290,30 @@ pipeline {
                     )
                 ]) {
                     sh '''
-                        echo "── Deploying ${BUILD_TAG} to production ──"
-
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
                             ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
 
                             set -e
-
                             cd ${APPS_DIR}
 
-                            echo "── Current running image ──"
-                            docker compose ps ${CONTAINER_NAME}
-
-                            echo "── Updating .env → ${ENV_VAR_NAME}=latest ──"
                             sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=latest|" .env
-
-                            echo "── Pulling latest image ──"
                             docker compose pull ${CONTAINER_NAME}
-
-                            echo "── Recreating container (zero-downtime) ──"
                             docker compose up -d --no-deps ${CONTAINER_NAME}
 
-                            echo "── Waiting 15s for container to stabilise ──"
                             sleep 15
 
-                            echo "── Container status ──"
-                            docker compose ps ${CONTAINER_NAME}
-
-                            echo "── Health check ──"
-                            STATUS=\$(docker inspect --format='{{.State.Status}}' ${CONTAINER_NAME})
+                            STATUS=\$(docker inspect \
+                                --format='{{.State.Status}}' ${CONTAINER_NAME})
                             if [ "\$STATUS" != "running" ]; then
-                                echo "✗ Container is not running — status: \$STATUS"
+                                echo "✗ Container not running: \$STATUS"
                                 docker logs ${CONTAINER_NAME} --tail 30
                                 exit 1
                             fi
 
-                            echo "✓ Container is running"
-
-                            echo "── Recent logs ──"
-                            docker logs ${CONTAINER_NAME} --tail 30
+                            echo "✓ Deployed ${BUILD_TAG} successfully"
+                            docker logs ${CONTAINER_NAME} --tail 20
 
 ENDSSH
                     '''
@@ -288,42 +321,37 @@ ENDSSH
             }
         }
 
-        // ── Stage 7: Smoke Test ───────────────────────────────────────────────
+        // ── Stage 8: Smoke Test ───────────────────────────────────────────────
         stage('Smoke Test') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             steps {
                 sh '''
-                    echo "── Running post-deploy smoke test ──"
-
-                    # Wait for app to be fully ready
+                    echo "── Post-deploy smoke test ──"
                     sleep 10
 
-                    # Hit health endpoint — retry up to 5 times
                     for i in 1 2 3 4 5; do
                         HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
                             https://cms.mytechbytes.in/health \
-                            --max-time 10 \
-                            --retry 0 || echo "000")
+                            --max-time 10 || echo "000")
 
                         echo "  Attempt ${i}: HTTP ${HTTP_STATUS}"
 
                         if [ "$HTTP_STATUS" = "200" ]; then
-                            echo "✓ Smoke test passed — app is responding"
+                            echo "✓ Smoke test passed"
                             exit 0
                         fi
-
                         sleep 5
                     done
 
-                    echo "✗ Smoke test failed — app not responding after 5 attempts"
+                    echo "✗ Smoke test failed after 5 attempts"
                     exit 1
                 '''
             }
         }
 
-        // ── Stage 8: Rollback ─────────────────────────────────────────────────
+        // ── Stage 9: Rollback ─────────────────────────────────────────────────
         stage('Rollback') {
             when {
                 expression { params.PIPELINE_ACTION == 'ROLLBACK' }
@@ -342,61 +370,46 @@ ENDSSH
                 ]) {
                     sh '''
                         if [ -z "${ROLLBACK_TAG}" ]; then
-                            echo "✗ ERROR: ROLLBACK_TAG is required"
-                            echo "  Example: build-13"
+                            echo "✗ ROLLBACK_TAG is required"
                             exit 1
                         fi
 
-                        echo "── Validating tag ${ROLLBACK_TAG} in OCIR ──"
+                        echo "── Validating tag ${ROLLBACK_TAG} ──"
                         echo "$OCIR_PASS" | docker login ${REGISTRY} \
                             -u "$OCIR_USER" --password-stdin
 
                         docker manifest inspect \
                             ${REGISTRY}/${OCI_NAMESPACE}/${IMAGE_NAME}:${ROLLBACK_TAG} \
                             > /dev/null 2>&1 || {
-                                echo "✗ ERROR: Tag ${ROLLBACK_TAG} not found in OCIR"
+                                echo "✗ Tag ${ROLLBACK_TAG} not found in OCIR"
                                 docker logout ${REGISTRY}
                                 exit 1
                             }
 
                         docker logout ${REGISTRY}
-                        echo "✓ Tag ${ROLLBACK_TAG} confirmed"
 
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            -o ConnectTimeout=30 \
                             ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
 
                             set -e
-
                             cd ${APPS_DIR}
 
-                            echo "── Current state ──"
-                            grep "^${ENV_VAR_NAME}" .env
-
-                            echo "── Rolling back to ${ROLLBACK_TAG} ──"
                             sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=${ROLLBACK_TAG}|" .env
-
-                            echo "── Pulling ${ROLLBACK_TAG} image ──"
                             docker compose pull ${CONTAINER_NAME}
-
-                            echo "── Recreating container with rollback image ──"
                             docker compose up -d --no-deps ${CONTAINER_NAME}
 
-                            echo "── Waiting 15s to stabilise ──"
                             sleep 15
 
-                            echo "── Container status ──"
-                            docker compose ps ${CONTAINER_NAME}
-
-                            STATUS=\$(docker inspect --format='{{.State.Status}}' ${CONTAINER_NAME})
+                            STATUS=\$(docker inspect \
+                                --format='{{.State.Status}}' ${CONTAINER_NAME})
                             if [ "\$STATUS" != "running" ]; then
-                                echo "✗ Rollback container failed — status: \$STATUS"
+                                echo "✗ Rollback container failed: \$STATUS"
                                 docker logs ${CONTAINER_NAME} --tail 30
                                 exit 1
                             fi
 
-                            echo "✓ Rollback successful — running ${ROLLBACK_TAG}"
+                            echo "✓ Rollback to ${ROLLBACK_TAG} successful"
                             docker logs ${CONTAINER_NAME} --tail 20
 
 ENDSSH
@@ -411,23 +424,28 @@ ENDSSH
 
         success {
             script {
-                def message = params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY'
-                    ? """✅ *MangoCMS — Build & Deploy Successful*
-                        • Job       : ${env.JOB_NAME}
-                        • Build     : #${env.BUILD_NUMBER} (${env.BUILD_TAG})
-                        • Commit    : ${sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()}
-                        • Author    : ${sh(script: "git log -1 --pretty=format:'%an'", returnStdout: true).trim()}
-                        • Message   : ${sh(script: "git log -1 --pretty=format:'%s'", returnStdout: true).trim()}
-                        • URL       : https://cms.mytechbytes.in"""
-                    : """✅ *MangoCMS — Rollback Successful*
-                        • Job       : ${env.JOB_NAME}
-                        • Build     : #${env.BUILD_NUMBER}
-                        • Rolled to : ${params.ROLLBACK_TAG}"""
+                def action = params.PIPELINE_ACTION
+                def subject = "✅ MangoCMS ${action} #${env.BUILD_NUMBER} — SUCCESS"
+                def body = action == 'BUILD_AND_DEPLOY' ? """
+✅ MangoCMS — Build & Deploy Successful
 
-                // Email notification
+Job       : ${env.JOB_NAME}
+Build     : #${env.BUILD_NUMBER} (${env.BUILD_TAG})
+Duration  : ${currentBuild.durationString}
+URL       : https://cms.mytechbytes.in
+Console   : ${env.BUILD_URL}console
+                """ : """
+✅ MangoCMS — Rollback Successful
+
+Job       : ${env.JOB_NAME}
+Build     : #${env.BUILD_NUMBER}
+Rolled to : ${params.ROLLBACK_TAG}
+Console   : ${env.BUILD_URL}console
+                """
+
                 emailext(
-                    subject: "✅ MangoCMS ${params.PIPELINE_ACTION} #${env.BUILD_NUMBER} — SUCCESS",
-                    body: message,
+                    subject: subject,
+                    body: body,
                     to: 'admin@mytechbytes.in',
                     mimeType: 'text/plain'
                 )
@@ -435,36 +453,40 @@ ENDSSH
         }
 
         failure {
-            script {
-                def message = """❌ *MangoCMS — Pipeline Failed*
-                    • Job       : ${env.JOB_NAME}
-                    • Build     : #${env.BUILD_NUMBER}
-                    • Action    : ${params.PIPELINE_ACTION}
-                    • Stage     : ${env.STAGE_NAME}
-                    • Logs      : ${env.BUILD_URL}console"""
+            emailext(
+                subject: "❌ MangoCMS ${params.PIPELINE_ACTION} #${env.BUILD_NUMBER} — FAILED",
+                body: """
+❌ MangoCMS — Pipeline Failed
 
-                emailext(
-                    subject: "❌ MangoCMS ${params.PIPELINE_ACTION} #${env.BUILD_NUMBER} — FAILED",
-                    body: message,
-                    to: 'admin@mytechbytes.in',
-                    mimeType: 'text/plain'
-                )
-            }
+Job     : ${env.JOB_NAME}
+Build   : #${env.BUILD_NUMBER}
+Action  : ${params.PIPELINE_ACTION}
+Console : ${env.BUILD_URL}console
+
+Check console output for details.
+                """,
+                to: 'admin@mytechbytes.in',
+                mimeType: 'text/plain'
+            )
         }
 
         always {
-            script {
-                // Clean workspace to prevent disk bloat on Jenkins CI instance
-                sh 'docker buildx prune -f --keep-storage 5GB || true'
+            sh '''
+                echo "── Cleaning up CI infrastructure ──"
 
-                // Clean up test artifacts
-                sh 'rm -rf cover/ || true'
+                # Stop and remove test postgres
+                docker stop mangocms-postgres-ci 2>/dev/null || true
+                docker rm   mangocms-postgres-ci 2>/dev/null || true
 
-                // Clean up .mix and .hex caches older than 7 days
-                sh 'find ${WORKSPACE}/.mix -mtime +7 -delete 2>/dev/null || true'
-                sh 'find ${WORKSPACE}/.hex -mtime +7 -delete 2>/dev/null || true'
-            }
+                # Remove CI network
+                docker network rm mangocms-ci 2>/dev/null || true
+
+                # Clean buildx cache
+                docker buildx prune -f --keep-storage 5GB || true
+
+                # Clean test coverage artifacts
+                rm -rf cover/ || true
+            '''
         }
     }
-    
 }

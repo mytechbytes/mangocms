@@ -35,3 +35,4 @@ mangocms-*.tar
 npm-debug.log
 /assets/node_modules/
 
+.elixir-tools/next-ls.log
