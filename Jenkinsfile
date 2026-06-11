@@ -27,6 +27,19 @@ pipeline {
 
     stages {
 
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:mytechbytes/mangocms.git',
+                        credentialsId: 'github-ssh-key-mytechbytes'
+                    ]]
+                ])
+            }
+        }
+
         stage('Build & Push') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
