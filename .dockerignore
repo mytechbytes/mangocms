@@ -1,4 +1,4 @@
-# Dependencies and build artifacts
+# Build artifacts
 deps/
 _build/
 .elixir_ls/
@@ -6,7 +6,10 @@ _build/
 # Node modules
 assets/node_modules/
 
-# Local env files
+# CI directory — never included in production image
+ci/
+
+# Local env
 .env
 .env.*
 
@@ -20,6 +23,7 @@ test/
 # Docs
 README.md
 CHANGELOG.md
+Makefile
 
 # Editor
 .vscode/
