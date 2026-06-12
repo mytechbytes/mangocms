@@ -1,11 +1,23 @@
 # =============================================================================
 # Stage 1 — Dependencies
-# Built on the CI image — git, build-base, hex, rebar already installed.
-# Only rebuild the CI image (ci/Dockerfile) when Elixir/OTP version changes.
+# Debian-based Elixir matches the runtime (debian:bookworm-slim / glibc).
+# Multi-arch image so --platform linux/arm64 in buildx resolves the arm64
+# variant — ERTS in the release is compiled for the same libc as the runtime.
 # =============================================================================
-FROM ap-mumbai-1.ocir.io/bmsedjmf13c1/mangocms-ci:latest AS deps
+FROM elixir:1.20.0-otp-29 AS deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV MIX_ENV=prod
+
+WORKDIR /app
+
+RUN mix local.hex --force && \
+    mix local.rebar --force
 
 # Copy dependency manifests first — Docker layer cache means deps only
 # reinstall when mix.exs or mix.lock changes, not on every code change

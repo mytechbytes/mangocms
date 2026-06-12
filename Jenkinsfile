@@ -59,8 +59,10 @@ pipeline {
             -v mangocms-mix:/root/.mix \
             -w /app \
             -e MIX_ENV=test \
-            -e DATABASE_URL=ecto://postgres:postgres@postgres-ci/mangocms_test \
-            -e SECRET_KEY_BASE=ci_secret_key_base_min_64_chars_xxxxxxxxxxxxxxxxxxxxxxxx \
+            -e PGHOST=mangocms-postgres-ci \
+            -e PGUSER=postgres \
+            -e PGPASSWORD=postgres \
+            -e SECRET_KEY_BASE=ci_secret_key_base_at_least_64_chars_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
             --network mangocms-ci \
             ${CI_IMAGE}"""
     }
@@ -90,6 +92,9 @@ pipeline {
         // can run.
         // ─────────────────────────────────────────────────────────────────────
         stage('CI Image') {
+            when {
+                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+            }
             steps {
                 withCredentials([
                     usernamePassword(
@@ -174,6 +179,9 @@ pipeline {
                     echo "── Creating CI Docker network ──"
                     docker network create mangocms-ci 2>/dev/null || true
 
+                    echo "── Removing any leftover postgres container ──"
+                    docker rm -f mangocms-postgres-ci 2>/dev/null || true
+
                     echo "── Starting test database ──"
                     docker run -d \
                         --name mangocms-postgres-ci \
@@ -184,13 +192,16 @@ pipeline {
                         postgres:16-alpine
 
                     echo "── Waiting for postgres to be ready ──"
+                    READY=false
                     for i in $(seq 1 30); do
                         docker exec mangocms-postgres-ci \
                             pg_isready -U postgres > /dev/null 2>&1 \
+                            && READY=true \
                             && echo "✓ Postgres ready after ${i}s" \
                             && break
                         sleep 1
                     done
+                    [ "$READY" = "true" ] || { echo "✗ Postgres did not start in 30s"; exit 1; }
                 '''
             }
         }
@@ -223,27 +234,34 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 4: Quality Checks (Parallel)
-        // Compile, Credo, and Dialyzer run simultaneously — saves time
-        // All three must pass to proceed to tests
+        // Stage 4a: Compile
+        // Must complete before Credo/Dialyzer — all three share the _build
+        // volume, so parallel writes would corrupt beam files.
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Compile') {
+            when {
+                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+            }
+            steps {
+                sh '''
+                    echo "── Compiling (warnings as errors) ──"
+                    ${DOCKER_RUN} sh -c "
+                        mix compile --warnings-as-errors &&
+                        echo '✓ Compile passed'
+                    "
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 4b: Quality Checks (Parallel)
+        // Credo and Dialyzer only read compiled artifacts — safe to parallelise
         // ─────────────────────────────────────────────────────────────────────
         stage('Quality Checks') {
             when {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             parallel {
-
-                stage('Compile') {
-                    steps {
-                        sh '''
-                            echo "── Compiling (warnings as errors) ──"
-                            ${DOCKER_RUN} sh -c "
-                                mix compile --warnings-as-errors &&
-                                echo '✓ Compile passed'
-                            "
-                        '''
-                    }
-                }
 
                 stage('Credo') {
                     steps {
@@ -347,7 +365,6 @@ print(d['stats']['total_percent'])
                         echo "── Building ARM64 image ──"
                         docker buildx build \
                             --platform linux/arm64 \
-                            --no-cache \
                             --label "git.commit=${GIT_COMMIT_SHORT}" \
                             --label "git.branch=${GIT_BRANCH_NAME}" \
                             --label "build.number=${BUILD_NUMBER}" \
@@ -381,6 +398,11 @@ print(d['stats']['total_percent'])
                     sshUserPrivateKey(
                         credentialsId: 'production-server-ssh',
                         keyFileVariable: 'SSH_KEY'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'ocir-credentials',
+                        usernameVariable: 'OCIR_USER',
+                        passwordVariable: 'OCIR_PASS'
                     )
                 ]) {
                     sh '''
@@ -398,8 +420,14 @@ print(d['stats']['total_percent'])
                             echo "── Updating image tag to latest ──"
                             sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=latest|" .env
 
+                            echo "── Logging in to OCIR ──"
+                            echo "${OCIR_PASS}" | docker login ${REGISTRY} \
+                                -u "${OCIR_USER}" --password-stdin
+
                             echo "── Pulling latest image ──"
                             docker compose pull ${CONTAINER_NAME}
+
+                            docker logout ${REGISTRY}
 
                             echo "── Recreating container (zero-downtime) ──"
                             docker compose up -d --no-deps ${CONTAINER_NAME}
@@ -499,11 +527,9 @@ ENDSSH
                             ${REGISTRY}/${OCI_NAMESPACE}/${IMAGE_NAME}:${ROLLBACK_TAG} \
                             > /dev/null 2>&1 || {
                                 echo "✗ Tag ${ROLLBACK_TAG} not found in OCIR"
-                                docker logout ${REGISTRY}
                                 exit 1
                             }
 
-                        docker logout ${REGISTRY}
                         echo "✓ Tag ${ROLLBACK_TAG} confirmed in OCIR"
 
                         ssh -i "$SSH_KEY" \
@@ -578,7 +604,7 @@ Console   : ${env.BUILD_URL}console
                 emailext(
                     subject: "✅ MangoCMS ${action} #${env.BUILD_NUMBER} — SUCCESS",
                     body: body,
-                    to: 'admin@mytechbytes.in',
+                    to: 'mytechbytes.official@gmail.com',
                     mimeType: 'text/plain'
                 )
             }
@@ -597,7 +623,7 @@ Console : ${env.BUILD_URL}console
 
 Check console output for details.
                 """,
-                to: 'admin@mytechbytes.in',
+                to: 'mytechbytes.official@gmail.com',
                 mimeType: 'text/plain'
             )
         }
@@ -614,7 +640,7 @@ Check console output for details.
                 docker network rm mangocms-ci 2>/dev/null || true
 
                 # Clean buildx cache — keep last 5GB to preserve layer cache
-                docker buildx prune -f --keep-storage 5GB || true
+                docker buildx prune -f --reserved-space 5GB || true
 
                 # Remove coverage artifacts from workspace
                 rm -rf cover/ || true
