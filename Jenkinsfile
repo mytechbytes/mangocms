@@ -31,6 +31,7 @@ pipeline {
         IMAGE_NAME      = 'mangocms'
         CONTAINER_NAME  = 'cms'
         ENV_VAR_NAME    = 'CMS_IMAGE_TAG'
+        APP_URL         = 'https://cms.mytechbytes.in'
 
         // ── Production Server ─────────────────────────────────────────────────
         PRODUCTION_HOST = '161.118.161.178'
@@ -470,7 +471,7 @@ ENDSSH
 
                     for i in 1 2 3 4 5; do
                         HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-                            https://cms.mytechbytes.in/health \
+                            ${APP_URL}/health \
                             --max-time 10 || echo "000")
 
                         echo "  Attempt ${i}: HTTP ${HTTP_STATUS}"
@@ -590,7 +591,7 @@ ENDSSH
 Job       : ${env.JOB_NAME}
 Build     : #${env.BUILD_NUMBER} (${env.BUILD_TAG})
 Duration  : ${currentBuild.durationString}
-App URL   : https://cms.mytechbytes.in
+App URL   : ${env.APP_URL}
 Console   : ${env.BUILD_URL}console
                 """ : """
 ✅ MangoCMS — Rollback Successful
