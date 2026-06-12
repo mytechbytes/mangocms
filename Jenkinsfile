@@ -436,11 +436,11 @@ print('PASS: {}%'.format(cov))
                             sleep 15
 
                             echo "── Health check ──"
-                            STATUS=\$(docker inspect \
+                            STATUS=\\$(docker inspect \
                                 --format='{{.State.Status}}' ${CONTAINER_NAME})
 
-                            if [ "\$STATUS" != "running" ]; then
-                                echo "✗ Container not running: \$STATUS"
+                            if [ "\\$STATUS" != "running" ]; then
+                                echo "✗ Container not running: \\$STATUS"
                                 docker logs ${CONTAINER_NAME} --tail 30
                                 exit 1
                             fi
@@ -556,11 +556,11 @@ ENDSSH
                             sleep 15
 
                             echo "── Health check ──"
-                            STATUS=\$(docker inspect \
+                            STATUS=\\$(docker inspect \
                                 --format='{{.State.Status}}' ${CONTAINER_NAME})
 
-                            if [ "\$STATUS" != "running" ]; then
-                                echo "✗ Rollback container failed: \$STATUS"
+                            if [ "\\$STATUS" != "running" ]; then
+                                echo "✗ Rollback container failed: \\$STATUS"
                                 docker logs ${CONTAINER_NAME} --tail 30
                                 exit 1
                             fi
