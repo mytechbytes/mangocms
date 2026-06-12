@@ -9,6 +9,7 @@ defmodule MangoCMS.MixProject do
       test_coverage: [tool: ExCoveralls],
       preferred_cli_env: [
         coveralls: :test,
+        "coveralls.detail": :test,
         "coveralls.json": :test,
         "coveralls.html": :test
       ],
