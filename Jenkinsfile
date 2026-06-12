@@ -307,25 +307,25 @@ pipeline {
                         echo '✓ Tests passed'
                     "
 
-                    echo "── Checking coverage threshold ──"
-                    COVERAGE=$(python3 -c "
-import json
-with open('cover/excoveralls.json') as f:
-    d = json.load(f)
-print(d['stats']['total_percent'])
-" 2>/dev/null || \
-                    grep -o '"total_percent":[0-9.]*' cover/excoveralls.json \
-                    | grep -o '[0-9.]*$')
-
-                    echo "  Coverage        : ${COVERAGE}%"
-                    echo "  Required minimum: ${COVERAGE_THRESHOLD}%"
-
-                    if [ $(echo "$COVERAGE < ${COVERAGE_THRESHOLD}" | bc -l) -eq 1 ]; then
-                        echo "✗ Coverage ${COVERAGE}% below threshold ${COVERAGE_THRESHOLD}%"
-                        exit 1
-                    fi
-
-                    echo "✓ Coverage check passed: ${COVERAGE}%"
+                    echo "── Checking coverage threshold (${COVERAGE_THRESHOLD}%) ──"
+                    docker run --rm \
+                        -v ${WORKSPACE}/cover:/cover:ro \
+                        -e COVERAGE_THRESHOLD=${COVERAGE_THRESHOLD} \
+                        ${CI_IMAGE} python3 -c "
+import json, os, sys
+with open('/cover/excoveralls.json') as f:
+    files = json.load(f)['source_files']
+relevant = sum(1 for sf in files for x in sf['coverage'] if x is not None)
+covered  = sum(1 for sf in files for x in sf['coverage'] if x is not None and x > 0)
+cov = round(100.0 * covered / relevant, 1) if relevant > 0 else 100.0
+threshold = float(os.environ['COVERAGE_THRESHOLD'])
+print('  Coverage        : {}%'.format(cov))
+print('  Required minimum: {}%'.format(int(threshold)))
+if cov < threshold:
+    print('FAIL: {}% below {}%'.format(cov, int(threshold)))
+    sys.exit(1)
+print('PASS: {}%'.format(cov))
+"
                 '''
             }
             post {
