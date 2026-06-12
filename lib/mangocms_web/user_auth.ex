@@ -1,4 +1,6 @@
 defmodule MangoCMSWeb.UserAuth do
+  @moduledoc false
+
   use MangoCMSWeb, :verified_routes
 
   import Plug.Conn

@@ -17,6 +17,9 @@ defmodule MangoCMSWeb.ConnCase do
 
   use ExUnit.CaseTemplate
 
+  alias MangoCMS.Accounts.Scope
+  alias MangoCMS.AccountsFixtures
+
   using do
     quote do
       # The default endpoint for testing
@@ -45,8 +48,8 @@ defmodule MangoCMSWeb.ConnCase do
   test context.
   """
   def register_and_log_in_user(%{conn: conn} = context) do
-    user = MangoCMS.AccountsFixtures.user_fixture()
-    scope = MangoCMS.Accounts.Scope.for_user(user)
+    user = AccountsFixtures.user_fixture()
+    scope = Scope.for_user(user)
 
     opts =
       context

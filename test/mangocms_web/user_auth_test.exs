@@ -1,10 +1,10 @@
 defmodule MangoCMSWeb.UserAuthTest do
   use MangoCMSWeb.ConnCase, async: true
 
-  alias Phoenix.LiveView
   alias MangoCMS.Accounts
   alias MangoCMS.Accounts.Scope
   alias MangoCMSWeb.UserAuth
+  alias Phoenix.LiveView
 
   import MangoCMS.AccountsFixtures
 

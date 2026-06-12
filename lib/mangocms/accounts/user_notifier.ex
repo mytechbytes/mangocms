@@ -1,8 +1,10 @@
 defmodule MangoCMS.Accounts.UserNotifier do
+  @moduledoc false
+
   import Swoosh.Email
 
-  alias MangoCMS.Mailer
   alias MangoCMS.Accounts.User
+  alias MangoCMS.Mailer
 
   # Delivers the email using the application mailer.
   defp deliver(recipient, subject, body) do

@@ -6,7 +6,7 @@ defmodule MangoCMS.Accounts do
   import Ecto.Query, warn: false
   alias MangoCMS.Repo
 
-  alias MangoCMS.Accounts.{User, UserToken, UserNotifier}
+  alias MangoCMS.Accounts.{User, UserNotifier, UserToken}
 
   ## Database getters
 

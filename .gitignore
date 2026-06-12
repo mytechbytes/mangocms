@@ -36,3 +36,8 @@ npm-debug.log
 /assets/node_modules/
 
 .elixir-tools/next-ls.log
+.DS_Store
+mix.lock
+.elixir-tools/next-ls.log
+.elixir-tools/next-ls.log
+.gitignore
