@@ -1,20 +1,11 @@
 # =============================================================================
 # Stage 1 — Dependencies
-# Fetch and compile all Elixir/Mix dependencies
+# Built on the CI image — git, build-base, hex, rebar already installed.
+# Only rebuild the CI image (ci/Dockerfile) when Elixir/OTP version changes.
 # =============================================================================
-FROM elixir:1.20.0-otp-29-alpine AS deps
-
-RUN apk add --no-cache \
-    build-base \
-    git \
-    curl
+FROM ap-mumbai-1.ocir.io/bmsedjmf13c1/mangocms-ci:latest AS deps
 
 ENV MIX_ENV=prod
-
-WORKDIR /app
-
-RUN mix local.hex --force && \
-    mix local.rebar --force
 
 # Copy dependency manifests first — Docker layer cache means deps only
 # reinstall when mix.exs or mix.lock changes, not on every code change

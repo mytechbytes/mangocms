@@ -17,6 +17,11 @@ pipeline {
             defaultValue: '80',
             description: 'Minimum test coverage % required to proceed.'
         )
+        booleanParam(
+            name: 'REBUILD_CI_IMAGE',
+            defaultValue: false,
+            description: 'Force rebuild and push of ci/Dockerfile. Set true when Elixir/OTP version changes.'
+        )
     }
 
     environment {
@@ -75,6 +80,53 @@ pipeline {
     }
 
     stages {
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 0: CI Image
+        // Build and push the CI runner image from ci/Dockerfile if it does not
+        // exist in OCIR yet, or if REBUILD_CI_IMAGE is checked.
+        // This image is the base for all Elixir pipeline stages AND for the
+        // production Dockerfile's build stages — so it must exist before either
+        // can run.
+        // ─────────────────────────────────────────────────────────────────────
+        stage('CI Image') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'ocir-credentials',
+                        usernameVariable: 'OCIR_USER',
+                        passwordVariable: 'OCIR_PASS'
+                    )
+                ]) {
+                    sh '''
+                        echo "── Logging in to OCIR ──"
+                        echo "$OCIR_PASS" | docker login ${REGISTRY} \
+                            -u "$OCIR_USER" --password-stdin
+
+                        NEEDS_BUILD=false
+
+                        if [ "${REBUILD_CI_IMAGE}" = "true" ]; then
+                            echo "── REBUILD_CI_IMAGE=true — forcing rebuild ──"
+                            NEEDS_BUILD=true
+                        elif ! docker manifest inspect ${CI_IMAGE} > /dev/null 2>&1; then
+                            echo "── CI image not found in OCIR — building for first time ──"
+                            NEEDS_BUILD=true
+                        else
+                            echo "✓ CI image exists in OCIR — skipping build"
+                            docker pull ${CI_IMAGE}
+                        fi
+
+                        if [ "$NEEDS_BUILD" = "true" ]; then
+                            docker build \
+                                -t ${CI_IMAGE} \
+                                ci/
+                            docker push ${CI_IMAGE}
+                            echo "✓ CI image pushed: ${CI_IMAGE}"
+                        fi
+                    '''
+                }
+            }
+        }
 
         // ─────────────────────────────────────────────────────────────────────
         // Stage 1: Checkout
@@ -566,6 +618,9 @@ Check console output for details.
 
                 # Remove coverage artifacts from workspace
                 rm -rf cover/ || true
+
+                # Logout from registry
+                docker logout ${REGISTRY} 2>/dev/null || true
             '''
         }
     }
