@@ -64,13 +64,16 @@ RUN mix release
 
 # =============================================================================
 # Stage 5 — Production Runtime
-# Ubuntu 24.04 LTS ships with glibc 2.39 — satisfies the glibc 2.38 minimum
-# that ERTS 17 (OTP 29) binaries are compiled against. Debian bookworm-slim
-# only has glibc 2.36 and causes "GLIBC_2.38 not found" at startup.
+# debian:trixie-slim — SAME Debian release (13/trixie) as the build image
+# (elixir:1.20.0-otp-29 is built on trixie). Keeping build and runtime on the
+# same OS release guarantees every native dependency matches: glibc (2.41),
+# OpenSSL (3.5 — crypto NIF requires it), ncurses, zlib.
+#   - debian:bookworm-slim failed:  glibc 2.36 < required 2.38
+#   - ubuntu:24.04 failed:          OpenSSL 3.0 < required 3.4 (crypto NIF)
 # Final image contains only the compiled release binary — no source code,
 # no mix, no hex, no build tools.
 # =============================================================================
-FROM ubuntu:24.04 AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
@@ -79,7 +82,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     bash \
     curl \
-    && locale-gen en_US.UTF-8 \
+    && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
+    && locale-gen \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LANG=en_US.UTF-8
@@ -87,7 +91,9 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 # Create non-root user — never run as root in production
-RUN groupadd -g 1000 appgroup && \
+# (userdel guards against base images that pre-create UID/GID 1000)
+RUN userdel -r "$(getent passwd 1000 | cut -d: -f1)" 2>/dev/null || true && \
+    groupadd -g 1000 appgroup && \
     useradd -u 1000 -g appgroup -s /bin/bash -m appuser
 
 WORKDIR /app

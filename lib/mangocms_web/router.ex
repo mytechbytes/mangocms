@@ -23,6 +23,13 @@ defmodule MangoCMSWeb.Router do
     get "/", PageController, :home
   end
 
+  # Health check — used by Docker HEALTHCHECK and Jenkins smoke test
+  scope "/", MangoCMSWeb do
+    pipe_through :api
+
+    get "/health", HealthController, :show
+  end
+
   # Other scopes may use custom stacks.
   # scope "/api", MangoCMSWeb do
   #   pipe_through :api
