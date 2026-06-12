@@ -642,8 +642,11 @@ Check console output for details.
                 # Clean buildx cache — keep last 5GB to preserve layer cache
                 docker buildx prune -f --reserved-space 5GB || true
 
-                # Remove coverage artifacts from workspace
-                rm -rf cover/ || true
+                # Remove coverage artifacts — created by Docker root so requires
+                # Docker to delete; fall back to plain rm if container unavailable
+                docker run --rm -v ${WORKSPACE}:/workspace ${CI_IMAGE} \
+                    sh -c "rm -rf /workspace/cover" 2>/dev/null \
+                    || rm -rf cover/ 2>/dev/null || true
 
                 # Logout from registry
                 docker logout ${REGISTRY} 2>/dev/null || true

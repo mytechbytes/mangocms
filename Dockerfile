@@ -64,12 +64,13 @@ RUN mix release
 
 # =============================================================================
 # Stage 5 — Production Runtime
-# Debian bookworm-slim — glibc based, no OpenSSL/musl compatibility issues
-# Matches the libc Erlang OTP 29 was compiled against — no crypto.so mismatch
+# Ubuntu 24.04 LTS ships with glibc 2.39 — satisfies the glibc 2.38 minimum
+# that ERTS 17 (OTP 29) binaries are compiled against. Debian bookworm-slim
+# only has glibc 2.36 and causes "GLIBC_2.38 not found" at startup.
 # Final image contains only the compiled release binary — no source code,
-# no mix, no hex, no build tools
+# no mix, no hex, no build tools.
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
@@ -78,10 +79,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     bash \
     curl \
+    && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set locale — required for Erlang
-RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
