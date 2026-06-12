@@ -82,23 +82,27 @@ pipeline {
         // ─────────────────────────────────────────────────────────────────────
         stage('Checkout') {
             steps {
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'git@github.com:mytechbytes/mangocms.git',
-                        credentialsId: 'github-ssh-key-mytechbytes'
-                    ]]
-                ])
+                script {
+                    def scm = checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[
+                            url: 'git@github.com:mytechbytes/mangocms.git',
+                            credentialsId: 'github-ssh-key-mytechbytes'
+                        ]]
+                    ])
+                    // Capture commit metadata from checkout result — no git binary needed
+                    env.GIT_COMMIT_SHORT = scm.GIT_COMMIT.take(7)
+                    env.GIT_BRANCH_NAME  = scm.GIT_BRANCH.replaceAll('^origin/', '')
+                }
 
                 sh '''
                     echo "╔══════════════════════════════════════════════╗"
                     echo "  Job     : ${JOB_NAME}"
                     echo "  Action  : ${PIPELINE_ACTION}"
                     echo "  Build   : #${BUILD_NUMBER} (${BUILD_TAG})"
-                    echo "  Commit  : $(git rev-parse --short HEAD)"
-                    echo "  Author  : $(git log -1 --pretty=format:'%an')"
-                    echo "  Message : $(git log -1 --pretty=format:'%s')"
+                    echo "  Commit  : ${GIT_COMMIT_SHORT}"
+                    echo "  Branch  : ${GIT_BRANCH_NAME}"
                     echo "╚══════════════════════════════════════════════╝"
                 '''
             }
@@ -292,8 +296,8 @@ print(d['stats']['total_percent'])
                         docker buildx build \
                             --platform linux/arm64 \
                             --no-cache \
-                            --label "git.commit=$(git rev-parse --short HEAD)" \
-                            --label "git.branch=$(git rev-parse --abbrev-ref HEAD)" \
+                            --label "git.commit=${GIT_COMMIT_SHORT}" \
+                            --label "git.branch=${GIT_BRANCH_NAME}" \
                             --label "build.number=${BUILD_NUMBER}" \
                             --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                             -t ${IMAGE_VERSIONED} \
