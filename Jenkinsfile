@@ -33,8 +33,9 @@ pipeline {
 
         // ── Shared CI Image ───────────────────────────────────────────────────
         // Shared across all Elixir app pipelines on this Jenkins server
-        // Only rebuilds when REBUILD_CI_IMAGE=true or image is missing locally
-        CI_IMAGE        = 'mytechbytes-elixir-ci:1.20.1-otp-29'
+        // Stored in OCIR so it survives Jenkins server rebuilds
+        // Only rebuilds when REBUILD_CI_IMAGE=true or image is missing in OCIR
+        CI_IMAGE        = 'ap-mumbai-1.ocir.io/bmsedjmf13c1/mytechbytes-elixir-ci:1.20.1-otp-29'
 
         // ── Docker Run ────────────────────────────────────────────────────────
         // Reused across all Elixir stages
@@ -131,26 +132,42 @@ pipeline {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             steps {
-                sh '''
-                    NEEDS_BUILD=false
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'ocir-credentials',
+                        usernameVariable: 'OCIR_USER',
+                        passwordVariable: 'OCIR_PASS'
+                    )
+                ]) {
+                    sh '''
+                        # Use a temp Docker config to bypass docker-credential-pass
+                        # for this stage — avoids GPG decryption issues during push
+                        export DOCKER_CONFIG=$(mktemp -d)
+                        trap "rm -rf $DOCKER_CONFIG" EXIT
 
-                    if [ "${REBUILD_CI_IMAGE}" = "true" ]; then
-                        echo "── REBUILD_CI_IMAGE=true — forcing rebuild ──"
-                        NEEDS_BUILD=true
-                    elif ! docker image inspect ${CI_IMAGE} > /dev/null 2>&1; then
-                        echo "── CI image not found locally — building for first time ──"
-                        NEEDS_BUILD=true
-                    else
-                        echo "✓ CI image found in local cache — skipping build"
-                    fi
+                        echo "$OCIR_PASS" | docker login ${REGISTRY} \
+                            -u "$OCIR_USER" --password-stdin
 
-                    if [ "$NEEDS_BUILD" = "true" ]; then
-                        docker build \
-                            -t ${CI_IMAGE} \
-                            ci/
-                        echo "✓ CI image built: ${CI_IMAGE}"
-                    fi
-                '''
+                        NEEDS_BUILD=false
+
+                        if [ "${REBUILD_CI_IMAGE}" = "true" ]; then
+                            echo "── REBUILD_CI_IMAGE=true — forcing rebuild ──"
+                            NEEDS_BUILD=true
+                        elif ! docker manifest inspect ${CI_IMAGE} > /dev/null 2>&1; then
+                            echo "── CI image not found in OCIR — building for first time ──"
+                            NEEDS_BUILD=true
+                        else
+                            echo "✓ CI image exists in OCIR — pulling to local cache"
+                            docker pull ${CI_IMAGE}
+                        fi
+
+                        if [ "$NEEDS_BUILD" = "true" ]; then
+                            docker build -t ${CI_IMAGE} ci/
+                            docker push ${CI_IMAGE}
+                            echo "✓ CI image pushed: ${CI_IMAGE}"
+                        fi
+                    '''
+                }
             }
         }
 
@@ -389,6 +406,8 @@ print('PASS: {}%'.format(cov))
                     // ── Step 1: Login to OCIR ─────────────────────────────────
                     sh '''
                         echo "── [1/3] Logging in to OCIR ──"
+                        export DOCKER_CONFIG=$(mktemp -d)
+                        echo "$DOCKER_CONFIG" > /tmp/mangocms-docker-config-path
                         echo "$OCIR_PASS" | docker login ${REGISTRY} \
                             -u "$OCIR_USER" --password-stdin
                         echo "✓ Logged in to ${REGISTRY}"
@@ -397,6 +416,7 @@ print('PASS: {}%'.format(cov))
                     // ── Step 2: Build & push ARM64 image ─────────────────────
                     sh '''
                         echo "── [2/3] Building ARM64 image (${DEPLOY_ENV}) ──"
+                        export DOCKER_CONFIG=$(cat /tmp/mangocms-docker-config-path)
                         docker buildx build \
                             --platform linux/arm64 \
                             --label "git.commit=${GIT_COMMIT_SHORT}" \
@@ -413,7 +433,9 @@ print('PASS: {}%'.format(cov))
                     // ── Step 3: Logout & confirm ──────────────────────────────
                     sh '''
                         echo "── [3/3] Confirming push ──"
+                        export DOCKER_CONFIG=$(cat /tmp/mangocms-docker-config-path)
                         docker logout ${REGISTRY}
+                        rm -rf $(cat /tmp/mangocms-docker-config-path) /tmp/mangocms-docker-config-path
                         echo "✓ Pushed: ${IMAGE_VERSIONED}"
                         echo "✓ Pushed: ${IMAGE_LATEST}"
                     '''
