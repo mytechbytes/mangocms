@@ -4,7 +4,7 @@
 # Multi-arch image so --platform linux/arm64 in buildx resolves the arm64
 # variant — ERTS in the release is compiled for the same libc as the runtime.
 # =============================================================================
-FROM elixir:1.20.0-otp-29 AS deps
+FROM elixir:1.20.1-otp-29 AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \

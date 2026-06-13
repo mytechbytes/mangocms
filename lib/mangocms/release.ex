@@ -1,4 +1,6 @@
 defmodule MangoCMS.Release do
+  @moduledoc false
+
   @app :mangocms
 
   def migrate do
