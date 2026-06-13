@@ -78,6 +78,7 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     libncurses6 \
+    libsctp1 \
     locales \
     ca-certificates \
     bash \
