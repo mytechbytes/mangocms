@@ -32,7 +32,7 @@ defmodule MangoCMS.MixProject do
   def application do
     [
       mod: {MangoCMS.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :ssl, :crypto]
     ]
   end
 
