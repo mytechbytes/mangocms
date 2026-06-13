@@ -58,19 +58,22 @@ defmodule MangoCMSWeb.UserLive.Registration do
   def handle_event("save", %{"user" => user_params}, socket) do
     case Accounts.register_user(user_params) do
       {:ok, user} ->
-        {:ok, _} =
-          Accounts.deliver_login_instructions(
-            user,
-            &url(~p"/users/log-in/#{&1}")
-          )
+        case Accounts.deliver_login_instructions(user, &url(~p"/users/log-in/#{&1}")) do
+          {:ok, _} ->
+            {:noreply,
+             socket
+             |> put_flash(
+               :info,
+               "An email was sent to #{user.email}, please access it to confirm your account."
+             )
+             |> push_navigate(to: ~p"/users/log-in")}
 
-        {:noreply,
-         socket
-         |> put_flash(
-           :info,
-           "An email was sent to #{user.email}, please access it to confirm your account."
-         )
-         |> push_navigate(to: ~p"/users/log-in")}
+          {:error, _} ->
+            {:noreply,
+             socket
+             |> put_flash(:error, "Account created but we could not send the confirmation email. Please try again later.")
+             |> push_navigate(to: ~p"/users/log-in")}
+        end
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:noreply, assign_form(socket, changeset)}

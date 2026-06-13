@@ -101,13 +101,16 @@ if config_env() == :prod do
   # Check `Plug.SSL` for all available options in `force_ssl`.
 
   # Mailer — Oracle Cloud Email Delivery via SMTP
-  config :mangocms, MangoCMS.Mailer,
-    adapter: Swoosh.Adapters.SMTP,
-    relay: System.get_env("SMTP_SERVER") || raise("SMTP_SERVER env var is missing"),
-    port: String.to_integer(System.get_env("SMTP_PORT") || "587"),
-    username: System.get_env("SMTP_USERNAME") || raise("SMTP_USERNAME env var is missing"),
-    password: System.get_env("SMTP_PASSWORD") || raise("SMTP_PASSWORD env var is missing"),
-    tls: :always,
-    auth: :always,
-    from_email: System.get_env("SMTP_FROM") || raise("SMTP_FROM env var is missing")
+  # Falls back to local (no-op) adapter if SMTP vars are not set
+  if System.get_env("SMTP_SERVER") do
+    config :mangocms, MangoCMS.Mailer,
+      adapter: Swoosh.Adapters.SMTP,
+      relay: System.get_env("SMTP_SERVER"),
+      port: String.to_integer(System.get_env("SMTP_PORT") || "587"),
+      username: System.get_env("SMTP_USERNAME"),
+      password: System.get_env("SMTP_PASSWORD"),
+      tls: :if_available,
+      auth: :always,
+      from_email: System.get_env("SMTP_FROM")
+  end
 end
