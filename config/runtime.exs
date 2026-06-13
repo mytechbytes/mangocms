@@ -100,21 +100,14 @@ if config_env() == :prod do
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.
 
-  # ## Configuring the mailer
-  #
-  # In production you need to configure the mailer to use a different adapter.
-  # Here is an example configuration for Mailgun:
-  #
-  #     config :mangocms, MangoCMS.Mailer,
-  #       adapter: Swoosh.Adapters.Mailgun,
-  #       api_key: System.get_env("MAILGUN_API_KEY"),
-  #       domain: System.get_env("MAILGUN_DOMAIN")
-  #
-  # Most non-SMTP adapters require an API client. Swoosh supports Req, Hackney,
-  # and Finch out-of-the-box. This configuration is typically done at
-  # compile-time in your config/prod.exs:
-  #
-  #     config :swoosh, :api_client, Swoosh.ApiClient.Req
-  #
-  # See https://hexdocs.pm/swoosh/Swoosh.html#module-installation for details.
+  # Mailer — Oracle Cloud Email Delivery via SMTP
+  config :mangocms, MangoCMS.Mailer,
+    adapter: Swoosh.Adapters.SMTP,
+    relay: System.get_env("SMTP_SERVER") || raise("SMTP_SERVER env var is missing"),
+    port: String.to_integer(System.get_env("SMTP_PORT") || "587"),
+    username: System.get_env("SMTP_USERNAME") || raise("SMTP_USERNAME env var is missing"),
+    password: System.get_env("SMTP_PASSWORD") || raise("SMTP_PASSWORD env var is missing"),
+    tls: :always,
+    auth: :always,
+    from_email: System.get_env("SMTP_FROM") || raise("SMTP_FROM env var is missing")
 end
