@@ -11,7 +11,7 @@ defmodule MangoCMS.Accounts.UserNotifier do
     email =
       new()
       |> to(recipient)
-      |> from({"MangoCMS", "contact@example.com"})
+      |> from({"MangoCMS", System.get_env("SMTP_FROM", "no-reply@mytechbytes.in")})
       |> subject(subject)
       |> text_body(body)
 
