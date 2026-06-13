@@ -140,11 +140,6 @@ pipeline {
                     )
                 ]) {
                     sh '''
-                        # Use a temp Docker config to bypass docker-credential-pass
-                        # for this stage — avoids GPG decryption issues during push
-                        export DOCKER_CONFIG=$(mktemp -d)
-                        trap "rm -rf $DOCKER_CONFIG" EXIT
-
                         echo "$OCIR_PASS" | docker login ${REGISTRY} \
                             -u "$OCIR_USER" --password-stdin
 
@@ -406,8 +401,6 @@ print('PASS: {}%'.format(cov))
                     // ── Step 1: Login to OCIR ─────────────────────────────────
                     sh '''
                         echo "── [1/3] Logging in to OCIR ──"
-                        export DOCKER_CONFIG=$(mktemp -d)
-                        echo "$DOCKER_CONFIG" > /tmp/mangocms-docker-config-path
                         echo "$OCIR_PASS" | docker login ${REGISTRY} \
                             -u "$OCIR_USER" --password-stdin
                         echo "✓ Logged in to ${REGISTRY}"
@@ -416,7 +409,6 @@ print('PASS: {}%'.format(cov))
                     // ── Step 2: Build & push ARM64 image ─────────────────────
                     sh '''
                         echo "── [2/3] Building ARM64 image (${DEPLOY_ENV}) ──"
-                        export DOCKER_CONFIG=$(cat /tmp/mangocms-docker-config-path)
                         docker buildx build \
                             --platform linux/arm64 \
                             --label "git.commit=${GIT_COMMIT_SHORT}" \
@@ -433,9 +425,7 @@ print('PASS: {}%'.format(cov))
                     // ── Step 3: Logout & confirm ──────────────────────────────
                     sh '''
                         echo "── [3/3] Confirming push ──"
-                        export DOCKER_CONFIG=$(cat /tmp/mangocms-docker-config-path)
                         docker logout ${REGISTRY}
-                        rm -rf $(cat /tmp/mangocms-docker-config-path) /tmp/mangocms-docker-config-path
                         echo "✓ Pushed: ${IMAGE_VERSIONED}"
                         echo "✓ Pushed: ${IMAGE_LATEST}"
                     '''
