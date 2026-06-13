@@ -176,14 +176,17 @@ pipeline {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             steps {
+                // ── Step 1: Network ───────────────────────────────────────────
                 sh '''
-                    echo "── Creating CI Docker network ──"
+                    echo "── [1/3] Creating CI network ──"
                     docker network create mangocms-ci 2>/dev/null || true
-
                     echo "── Removing any leftover postgres container ──"
                     docker rm -f mangocms-postgres-ci 2>/dev/null || true
+                '''
 
-                    echo "── Starting test database ──"
+                // ── Step 2: Start postgres ────────────────────────────────────
+                sh '''
+                    echo "── [2/3] Starting test database ──"
                     docker run -d \
                         --name mangocms-postgres-ci \
                         --network mangocms-ci \
@@ -191,8 +194,11 @@ pipeline {
                         -e POSTGRES_PASSWORD=postgres \
                         -e POSTGRES_DB=mangocms_test \
                         postgres:16-alpine
+                '''
 
-                    echo "── Waiting for postgres to be ready ──"
+                // ── Step 3: Wait for readiness ────────────────────────────────
+                sh '''
+                    echo "── [3/3] Waiting for postgres to be ready ──"
                     READY=false
                     for i in $(seq 1 30); do
                         docker exec mangocms-postgres-ci \
@@ -217,14 +223,18 @@ pipeline {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             steps {
+                // ── Step 1: Fetch dependencies ────────────────────────────────
                 sh '''
-                    echo "── Fetching dependencies ──"
+                    echo "── [1/2] Fetching dependencies ──"
                     ${DOCKER_RUN} sh -c "
                         mix deps.get &&
                         echo '✓ Dependencies fetched'
                     "
+                '''
 
-                    echo "── Setting up test database ──"
+                // ── Step 2: Setup test database ───────────────────────────────
+                sh '''
+                    echo "── [2/2] Setting up test database ──"
                     ${DOCKER_RUN} sh -c "
                         mix ecto.create &&
                         mix ecto.migrate &&
@@ -301,14 +311,18 @@ pipeline {
                 expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
             }
             steps {
+                // ── Step 1: Run ExUnit test suite ─────────────────────────────
                 sh '''
-                    echo "── Running ExUnit with coverage ──"
+                    echo "── [1/2] Running ExUnit with coverage ──"
                     ${DOCKER_RUN} sh -c "
                         mix coveralls.json --exclude wip &&
                         echo '✓ Tests passed'
                     "
+                '''
 
-                    echo "── Checking coverage threshold (${COVERAGE_THRESHOLD}%) ──"
+                // ── Step 2: Check coverage threshold ─────────────────────────
+                sh '''
+                    echo "── [2/2] Checking coverage threshold (${COVERAGE_THRESHOLD}%) ──"
                     docker run --rm \
                         -v ${WORKSPACE}/cover:/cover:ro \
                         -e COVERAGE_THRESHOLD=${COVERAGE_THRESHOLD} \
@@ -358,12 +372,17 @@ print('PASS: {}%'.format(cov))
                         passwordVariable: 'OCIR_PASS'
                     )
                 ]) {
+                    // ── Step 1: Login to OCIR ─────────────────────────────────
                     sh '''
-                        echo "── Logging in to OCIR ──"
+                        echo "── [1/3] Logging in to OCIR ──"
                         echo "$OCIR_PASS" | docker login ${REGISTRY} \
                             -u "$OCIR_USER" --password-stdin
+                        echo "✓ Logged in to ${REGISTRY}"
+                    '''
 
-                        echo "── Building ARM64 image ──"
+                    // ── Step 2: Build & push ARM64 image ─────────────────────
+                    sh '''
+                        echo "── [2/3] Building ARM64 image ──"
                         docker buildx build \
                             --platform linux/arm64 \
                             --label "git.commit=${GIT_COMMIT_SHORT}" \
@@ -374,9 +393,12 @@ print('PASS: {}%'.format(cov))
                             -t ${IMAGE_LATEST} \
                             --push \
                             .
+                    '''
 
+                    // ── Step 3: Logout & confirm ──────────────────────────────
+                    sh '''
+                        echo "── [3/3] Confirming push ──"
                         docker logout ${REGISTRY}
-
                         echo "✓ Pushed: ${IMAGE_VERSIONED}"
                         echo "✓ Pushed: ${IMAGE_LATEST}"
                     '''
@@ -386,9 +408,12 @@ print('PASS: {}%'.format(cov))
 
         // ─────────────────────────────────────────────────────────────────────
         // Stage 7: Deploy
-        // SSH into Instance 2, update .env, pull latest image
-        // Recreates only the app container — no downtime on other services
-        // Verifies container is running after deploy
+        // Five discrete steps so each appears separately in Jenkins output:
+        //   1. Update .env with new image tag
+        //   2. Pull new image from OCIR
+        //   3. Recreate container (zero-downtime, other services untouched)
+        //   4. Run database migrations
+        //   5. Verify container is healthy and tail logs
         // ─────────────────────────────────────────────────────────────────────
         stage('Deploy') {
             when {
@@ -406,37 +431,78 @@ print('PASS: {}%'.format(cov))
                         passwordVariable: 'OCIR_PASS'
                     )
                 ]) {
+
+                    // ── Step 1: Update image tag ──────────────────────────────
                     sh '''
+                        echo "── [1/5] Updating image tag ──"
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
                             ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
-
                             set -e
                             cd ${APPS_DIR}
-
-                            echo "── Current state ──"
+                            echo "  Before:"
                             grep "^${ENV_VAR_NAME}" .env
-
-                            echo "── Updating image tag to latest ──"
                             sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=latest|" .env
+                            echo "  After:"
+                            grep "^${ENV_VAR_NAME}" .env
+ENDSSH
+                    '''
 
-                            echo "── Logging in to OCIR ──"
+                    // ── Step 2: Pull latest image ─────────────────────────────
+                    sh '''
+                        echo "── [2/5] Pulling latest image ──"
+                        ssh -i "$SSH_KEY" \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=30 \
+                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            set -e
+                            cd ${APPS_DIR}
                             echo "${OCIR_PASS}" | docker login ${REGISTRY} \
                                 -u "${OCIR_USER}" --password-stdin
-
-                            echo "── Pulling latest image ──"
                             docker compose pull ${CONTAINER_NAME}
-
                             docker logout ${REGISTRY}
+                            echo "✓ Image pulled"
+ENDSSH
+                    '''
 
-                            echo "── Recreating container (zero-downtime) ──"
+                    // ── Step 3: Recreate container ────────────────────────────
+                    sh '''
+                        echo "── [3/5] Recreating container ──"
+                        ssh -i "$SSH_KEY" \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=30 \
+                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            set -e
+                            cd ${APPS_DIR}
                             docker compose up -d --no-deps ${CONTAINER_NAME}
+                            echo "✓ Container recreated"
+ENDSSH
+                    '''
 
-                            echo "── Waiting 15s to stabilise ──"
-                            sleep 15
+                    // ── Step 4: Run migrations ────────────────────────────────
+                    sh '''
+                        echo "── [4/5] Running migrations ──"
+                        echo "── Waiting 15s for container to stabilise ──"
+                        sleep 15
+                        ssh -i "$SSH_KEY" \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=30 \
+                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            set -e
+                            docker exec ${CONTAINER_NAME} \
+                                /app/bin/mangocms eval "MangoCMS.Release.migrate()"
+                            echo "✓ Migrations complete"
+ENDSSH
+                    '''
 
-                            echo "── Health check ──"
+                    // ── Step 5: Verify deployment ─────────────────────────────
+                    sh '''
+                        echo "── [5/5] Verifying deployment ──"
+                        ssh -i "$SSH_KEY" \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=30 \
+                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
                             STATUS=\\$(docker inspect \
                                 --format='{{.State.Status}}' ${CONTAINER_NAME})
 
@@ -446,9 +512,9 @@ print('PASS: {}%'.format(cov))
                                 exit 1
                             fi
 
-                            echo "✓ Deployed ${BUILD_TAG} successfully"
+                            echo "✓ Container status: \\$STATUS"
                             docker logs ${CONTAINER_NAME} --tail 20
-
+                            echo "✓ Deployed ${BUILD_TAG} successfully"
 ENDSSH
                     '''
                 }
@@ -492,10 +558,13 @@ ENDSSH
 
         // ─────────────────────────────────────────────────────────────────────
         // Stage 9: Rollback
-        // Validates tag exists in OCIR before touching .env
-        // Updates .env to point to historical tag
-        // Recreates container with historical image
-        // Verifies container is running after rollback
+        // Four discrete steps:
+        //   1. Validate tag exists in OCIR (local — safe, never touches server)
+        //   2. Update .env and pull rollback image on server
+        //   3. Recreate container with rollback image
+        //   4. Verify container is healthy and tail logs
+        // Note: migrations are NOT run on rollback — the old image already
+        // ran against the schema it expects.
         // ─────────────────────────────────────────────────────────────────────
         stage('Rollback') {
             when {
@@ -513,14 +582,16 @@ ENDSSH
                         keyFileVariable: 'SSH_KEY'
                     )
                 ]) {
+
+                    // ── Step 1: Validate rollback tag in OCIR ─────────────────
                     sh '''
+                        echo "── [1/4] Validating rollback tag ──"
                         if [ -z "${ROLLBACK_TAG}" ]; then
                             echo "✗ ROLLBACK_TAG is required"
                             echo "  Example: build-13"
                             exit 1
                         fi
 
-                        echo "── Validating tag ${ROLLBACK_TAG} in OCIR ──"
                         echo "$OCIR_PASS" | docker login ${REGISTRY} \
                             -u "$OCIR_USER" --password-stdin
 
@@ -531,32 +602,55 @@ ENDSSH
                                 exit 1
                             }
 
+                        docker logout ${REGISTRY}
                         echo "✓ Tag ${ROLLBACK_TAG} confirmed in OCIR"
+                    '''
 
+                    // ── Step 2: Update .env & pull rollback image ─────────────
+                    sh '''
+                        echo "── [2/4] Updating .env and pulling rollback image ──"
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
                             ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
-
                             set -e
                             cd ${APPS_DIR}
-
-                            echo "── Current state ──"
+                            echo "  Before:"
                             grep "^${ENV_VAR_NAME}" .env
-
-                            echo "── Rolling back to ${ROLLBACK_TAG} ──"
                             sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=${ROLLBACK_TAG}|" .env
-
-                            echo "── Pulling ${ROLLBACK_TAG} image ──"
+                            echo "  After:"
+                            grep "^${ENV_VAR_NAME}" .env
+                            echo "${OCIR_PASS}" | docker login ${REGISTRY} \
+                                -u "${OCIR_USER}" --password-stdin
                             docker compose pull ${CONTAINER_NAME}
+                            docker logout ${REGISTRY}
+                            echo "✓ Pulled ${ROLLBACK_TAG}"
+ENDSSH
+                    '''
 
-                            echo "── Recreating container with rollback image ──"
+                    // ── Step 3: Recreate container ────────────────────────────
+                    sh '''
+                        echo "── [3/4] Recreating container ──"
+                        ssh -i "$SSH_KEY" \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=30 \
+                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            set -e
+                            cd ${APPS_DIR}
                             docker compose up -d --no-deps ${CONTAINER_NAME}
+                            echo "✓ Container recreated"
+ENDSSH
+                    '''
 
-                            echo "── Waiting 15s to stabilise ──"
-                            sleep 15
-
-                            echo "── Health check ──"
+                    // ── Step 4: Verify rollback ───────────────────────────────
+                    sh '''
+                        echo "── [4/4] Verifying rollback ──"
+                        echo "── Waiting 15s for container to stabilise ──"
+                        sleep 15
+                        ssh -i "$SSH_KEY" \
+                            -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=30 \
+                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
                             STATUS=\\$(docker inspect \
                                 --format='{{.State.Status}}' ${CONTAINER_NAME})
 
@@ -566,9 +660,9 @@ ENDSSH
                                 exit 1
                             fi
 
-                            echo "✓ Rollback to ${ROLLBACK_TAG} successful"
+                            echo "✓ Container status: \\$STATUS"
                             docker logs ${CONTAINER_NAME} --tail 20
-
+                            echo "✓ Rollback to ${ROLLBACK_TAG} successful"
 ENDSSH
                     '''
                 }
