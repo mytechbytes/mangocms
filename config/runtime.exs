@@ -111,6 +111,7 @@ if config_env() == :prod do
       password: System.get_env("SMTP_PASSWORD"),
       tls: :if_available,
       auth: :always,
-      from_email: System.get_env("SMTP_FROM")
+      from_email: System.get_env("SMTP_FROM"),
+      tls_options: [verify: :verify_none]
   end
 end
