@@ -1,11 +1,11 @@
 # =============================================================================
-# MangoCMS CI Runner Image
+# Shared Elixir CI Runner Image
 #
 # Purpose : Run mix test, credo, dialyzer inside Jenkins pipeline
-# Based on: elixir:1.20.1-otp-29-alpine (matches production Dockerfile)
-# Built by: developer manually — only rebuild when Elixir/OTP version changes
-# Used by : Jenkins pipeline stages (Quality Checks, Tests & Coverage)
-# NOT used: in production — this image never runs on Instance 2
+# Based on: elixir:1.20.1-otp-29-alpine
+# Built by: Jenkins CI Image stage — only rebuilds when REBUILD_CI_IMAGE=true
+# Used by : All Elixir/Phoenix app pipelines (mangocms, quoteassist, mangogst…)
+# NOT used: in production — this image never runs on the production server
 # =============================================================================
 FROM elixir:1.20.1-otp-29-alpine
 

@@ -10,7 +10,7 @@ pipeline {
         string(
             name: 'ROLLBACK_TAG',
             defaultValue: '',
-            description: 'Required for ROLLBACK only. e.g. build-13'
+            description: 'Required for ROLLBACK only. e.g. build-13 (main) or stg-13 (develop)'
         )
         string(
             name: 'COVERAGE_THRESHOLD',
@@ -20,7 +20,7 @@ pipeline {
         booleanParam(
             name: 'REBUILD_CI_IMAGE',
             defaultValue: false,
-            description: 'Force rebuild and push of ci/Dockerfile. Set true when Elixir/OTP version changes.'
+            description: 'Force rebuild of mytechbytes-elixir-ci local image. Set true when Elixir/OTP version changes.'
         )
     }
 
@@ -29,24 +29,12 @@ pipeline {
         REGISTRY        = 'ap-mumbai-1.ocir.io'
         OCI_NAMESPACE   = 'bmsedjmf13c1'
         IMAGE_NAME      = 'mangocms'
-        CONTAINER_NAME  = 'cms'
-        ENV_VAR_NAME    = 'CMS_IMAGE_TAG'
-        APP_URL         = 'https://cms.mytechbytes.in'
-
-        // ── Production Server ─────────────────────────────────────────────────
-        PRODUCTION_HOST = '161.118.161.178'
         PRODUCTION_USER = 'ubuntu'
-        APPS_DIR        = '/home/ubuntu/apps'
 
-        // ── Auto-computed Tags ────────────────────────────────────────────────
-        BUILD_TAG       = "build-${env.BUILD_NUMBER}"
-        IMAGE_VERSIONED = "${REGISTRY}/${OCI_NAMESPACE}/${IMAGE_NAME}:build-${env.BUILD_NUMBER}"
-        IMAGE_LATEST    = "${REGISTRY}/${OCI_NAMESPACE}/${IMAGE_NAME}:latest"
-
-        // ── CI Image ──────────────────────────────────────────────────────────
-        // Custom image with git + build-base + hex + rebar pre-installed
-        // Only rebuild ci/Dockerfile when Elixir/OTP version changes
-        CI_IMAGE        = 'ap-mumbai-1.ocir.io/bmsedjmf13c1/mangocms-ci:latest'
+        // ── Shared CI Image ───────────────────────────────────────────────────
+        // Shared across all Elixir app pipelines on this Jenkins server
+        // Only rebuilds when REBUILD_CI_IMAGE=true or image is missing locally
+        CI_IMAGE        = 'mytechbytes-elixir-ci:1.20.1-otp-29'
 
         // ── Docker Run ────────────────────────────────────────────────────────
         // Reused across all Elixir stages
@@ -69,7 +57,7 @@ pipeline {
     }
 
     options {
-        // Keep last 10 builds — prevents disk bloat on Instance 1
+        // Keep last 10 builds — prevents disk bloat on Jenkins server
         buildDiscarder(logRotator(numToKeepStr: '10'))
 
         // Abort if pipeline exceeds 30 minutes
@@ -85,89 +73,115 @@ pipeline {
     stages {
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 0: CI Image
-        // Build and push the CI runner image from ci/Dockerfile if it does not
-        // exist in OCIR yet, or if REBUILD_CI_IMAGE is checked.
-        // This image is the base for all Elixir pipeline stages AND for the
-        // production Dockerfile's build stages — so it must exist before either
-        // can run.
+        // Stage 0: Configure
+        // Set branch-specific environment variables so all later stages are
+        // environment-agnostic. main → production, develop → staging.
         // ─────────────────────────────────────────────────────────────────────
-        stage('CI Image') {
-            when {
-                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
-            }
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'ocir-credentials',
-                        usernameVariable: 'OCIR_USER',
-                        passwordVariable: 'OCIR_PASS'
-                    )
-                ]) {
-                    sh '''
-                        echo "── Logging in to OCIR ──"
-                        echo "$OCIR_PASS" | docker login ${REGISTRY} \
-                            -u "$OCIR_USER" --password-stdin
-
-                        NEEDS_BUILD=false
-
-                        if [ "${REBUILD_CI_IMAGE}" = "true" ]; then
-                            echo "── REBUILD_CI_IMAGE=true — forcing rebuild ──"
-                            NEEDS_BUILD=true
-                        elif ! docker manifest inspect ${CI_IMAGE} > /dev/null 2>&1; then
-                            echo "── CI image not found in OCIR — building for first time ──"
-                            NEEDS_BUILD=true
-                        else
-                            echo "✓ CI image exists in OCIR — skipping build"
-                            docker pull ${CI_IMAGE}
-                        fi
-
-                        if [ "$NEEDS_BUILD" = "true" ]; then
-                            docker build \
-                                -t ${CI_IMAGE} \
-                                ci/
-                            docker push ${CI_IMAGE}
-                            echo "✓ CI image pushed: ${CI_IMAGE}"
-                        fi
-                    '''
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // Stage 1: Checkout
-        // Clone source code from GitHub using SSH key
-        // ─────────────────────────────────────────────────────────────────────
-        stage('Checkout') {
+        stage('Configure') {
             steps {
                 script {
-                    def scm = checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/main']],
-                        userRemoteConfigs: [[
-                            url: 'git@github.com:mytechbytes/mangocms.git',
-                            credentialsId: 'github-ssh-key-mytechbytes'
-                        ]]
-                    ])
-                    // Capture commit metadata from checkout result — no git binary needed
-                    env.GIT_COMMIT_SHORT = scm.GIT_COMMIT.take(7)
-                    env.GIT_BRANCH_NAME  = scm.GIT_BRANCH.replaceAll('^origin/', '')
+                    switch (env.BRANCH_NAME) {
+                        case 'main':
+                            env.DEPLOY_ENV       = 'production'
+                            env.TARGET_HOST      = '161.118.161.178'
+                            env.TARGET_APPS_DIR  = '/home/ubuntu/apps'
+                            env.CONTAINER_NAME   = 'cms'
+                            env.ENV_VAR_NAME     = 'CMS_IMAGE_TAG'
+                            env.APP_URL          = 'https://cms.mytechbytes.in'
+                            env.IMAGE_TAG        = "prd-${env.BUILD_NUMBER}"
+                            env.IMAGE_LATEST_TAG = 'prd-latest'
+                            break
+                        case 'develop':
+                            env.DEPLOY_ENV       = 'staging'
+                            env.TARGET_HOST      = '161.118.161.178'
+                            env.TARGET_APPS_DIR  = '/home/ubuntu/apps-stg'
+                            env.CONTAINER_NAME   = 'cms-stg'
+                            env.ENV_VAR_NAME     = 'CMS_STG_IMAGE_TAG'
+                            env.APP_URL          = 'https://stg.cms.mytechbytes.in'
+                            env.IMAGE_TAG        = "stg-${env.BUILD_NUMBER}"
+                            env.IMAGE_LATEST_TAG = 'stg-latest'
+                            break
+                        default:
+                            env.DEPLOY_ENV       = 'ci-only'
+                            env.IMAGE_TAG        = "pr-${env.BUILD_NUMBER}"
+                            env.IMAGE_LATEST_TAG = 'pr-latest'
+                    }
+                    env.IMAGE_VERSIONED = "${env.REGISTRY}/${env.OCI_NAMESPACE}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+                    env.IMAGE_LATEST    = "${env.REGISTRY}/${env.OCI_NAMESPACE}/${env.IMAGE_NAME}:${env.IMAGE_LATEST_TAG}"
                 }
 
                 sh '''
                     echo "╔══════════════════════════════════════════════╗"
-                    echo "  Job     : ${JOB_NAME}"
+                    echo "  Branch  : ${BRANCH_NAME}"
+                    echo "  Target  : ${DEPLOY_ENV}"
                     echo "  Action  : ${PIPELINE_ACTION}"
-                    echo "  Build   : #${BUILD_NUMBER} (${BUILD_TAG})"
-                    echo "  Commit  : ${GIT_COMMIT_SHORT}"
-                    echo "  Branch  : ${GIT_BRANCH_NAME}"
+                    echo "  Build   : #${BUILD_NUMBER} (${IMAGE_TAG})"
                     echo "╚══════════════════════════════════════════════╝"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 2: CI Infrastructure
+        // Stage 1: CI Image
+        // Build the shared Elixir CI runner image locally if missing or forced.
+        // Stored in Jenkins local Docker cache — not pushed to any registry.
+        // ─────────────────────────────────────────────────────────────────────
+        stage('CI Image') {
+            when {
+                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+            }
+            steps {
+                sh '''
+                    NEEDS_BUILD=false
+
+                    if [ "${REBUILD_CI_IMAGE}" = "true" ]; then
+                        echo "── REBUILD_CI_IMAGE=true — forcing rebuild ──"
+                        NEEDS_BUILD=true
+                    elif ! docker image inspect ${CI_IMAGE} > /dev/null 2>&1; then
+                        echo "── CI image not found locally — building for first time ──"
+                        NEEDS_BUILD=true
+                    else
+                        echo "✓ CI image found in local cache — skipping build"
+                    fi
+
+                    if [ "$NEEDS_BUILD" = "true" ]; then
+                        docker build \
+                            -t ${CI_IMAGE} \
+                            ci/
+                        echo "✓ CI image built: ${CI_IMAGE}"
+                    fi
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 2: Checkout
+        // Clone source code — branch is resolved automatically by Multibranch
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                script {
+                    def scm = checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "*/${env.BRANCH_NAME}"]],
+                        userRemoteConfigs: [[
+                            url: 'git@github.com:mytechbytes/mangocms.git',
+                            credentialsId: 'github-ssh-key-mytechbytes'
+                        ]]
+                    ])
+                    env.GIT_COMMIT_SHORT = scm.GIT_COMMIT.take(7)
+                    env.GIT_BRANCH_NAME  = scm.GIT_BRANCH.replaceAll('^origin/', '')
+                }
+
+                sh '''
+                    echo "  Commit  : ${GIT_COMMIT_SHORT}"
+                    echo "  Image   : ${IMAGE_VERSIONED}"
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 3: CI Infrastructure
         // Spin up test postgres on isolated Docker network
         // Torn down in post.always regardless of pass/fail
         // ─────────────────────────────────────────────────────────────────────
@@ -214,9 +228,8 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 3: Setup
+        // Stage 4: Setup
         // Fetch Mix dependencies and prepare test database
-        // Runs inside CI Docker container — no Elixir needed on Jenkins agent
         // ─────────────────────────────────────────────────────────────────────
         stage('Setup') {
             when {
@@ -245,7 +258,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 4a: Compile
+        // Stage 5: Compile
         // Must complete before Credo/Dialyzer — all three share the _build
         // volume, so parallel writes would corrupt beam files.
         // ─────────────────────────────────────────────────────────────────────
@@ -265,7 +278,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 4b: Quality Checks (Parallel)
+        // Stage 6: Quality Checks (Parallel)
         // Credo and Dialyzer only read compiled artifacts — safe to parallelise
         // ─────────────────────────────────────────────────────────────────────
         stage('Quality Checks') {
@@ -301,10 +314,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 5: Tests & Coverage
+        // Stage 7: Tests & Coverage
         // ExUnit full suite with ExCoveralls JSON output
         // Fails pipeline if coverage drops below COVERAGE_THRESHOLD
-        // Archives coverage report as Jenkins artifact
         // ─────────────────────────────────────────────────────────────────────
         stage('Tests & Coverage') {
             when {
@@ -345,7 +357,6 @@ print('PASS: {}%'.format(cov))
             }
             post {
                 always {
-                    // Archive coverage report — viewable in Jenkins UI
                     archiveArtifacts(
                         artifacts: 'cover/**/*',
                         allowEmptyArchive: true
@@ -355,14 +366,17 @@ print('PASS: {}%'.format(cov))
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 6: Build & Push
+        // Stage 8: Build & Push
         // Build ARM64 production image via docker buildx
-        // Pushes two tags: build-N (permanent) and latest (floating)
-        // Image labels include git commit, branch, build number, date
+        // Pushes versioned tag (build-N / stg-N) and floating tag (latest / stg-latest)
+        // Skipped for branches other than main and develop
         // ─────────────────────────────────────────────────────────────────────
         stage('Build & Push') {
             when {
-                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                allOf {
+                    expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                    anyOf { branch 'main'; branch 'develop' }
+                }
             }
             steps {
                 withCredentials([
@@ -382,12 +396,13 @@ print('PASS: {}%'.format(cov))
 
                     // ── Step 2: Build & push ARM64 image ─────────────────────
                     sh '''
-                        echo "── [2/3] Building ARM64 image ──"
+                        echo "── [2/3] Building ARM64 image (${DEPLOY_ENV}) ──"
                         docker buildx build \
                             --platform linux/arm64 \
                             --label "git.commit=${GIT_COMMIT_SHORT}" \
                             --label "git.branch=${GIT_BRANCH_NAME}" \
                             --label "build.number=${BUILD_NUMBER}" \
+                            --label "build.env=${DEPLOY_ENV}" \
                             --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                             -t ${IMAGE_VERSIONED} \
                             -t ${IMAGE_LATEST} \
@@ -407,17 +422,43 @@ print('PASS: {}%'.format(cov))
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 7: Deploy
-        // Five discrete steps so each appears separately in Jenkins output:
+        // Stage 9: Approval (production only)
+        // CI runs automatically on main. Deployment waits for a human to
+        // approve in the Jenkins UI — develop deploys automatically.
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Approval') {
+            when {
+                allOf {
+                    expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                    branch 'main'
+                }
+            }
+            steps {
+                timeout(time: 24, unit: 'HOURS') {
+                    input(
+                        message: "Deploy ${IMAGE_TAG} to production?",
+                        ok: 'Deploy to Production'
+                    )
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 10: Deploy
+        // Five discrete steps:
         //   1. Update .env with new image tag
         //   2. Pull new image from OCIR
         //   3. Recreate container (zero-downtime, other services untouched)
         //   4. Run database migrations
         //   5. Verify container is healthy and tail logs
+        // Skipped for branches other than main and develop
         // ─────────────────────────────────────────────────────────────────────
         stage('Deploy') {
             when {
-                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                allOf {
+                    expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                    anyOf { branch 'main'; branch 'develop' }
+                }
             }
             steps {
                 withCredentials([
@@ -434,16 +475,16 @@ print('PASS: {}%'.format(cov))
 
                     // ── Step 1: Update image tag ──────────────────────────────
                     sh '''
-                        echo "── [1/5] Updating image tag ──"
+                        echo "── [1/5] Updating image tag on ${DEPLOY_ENV} ──"
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             set -e
-                            cd ${APPS_DIR}
+                            cd ${TARGET_APPS_DIR}
                             echo "  Before:"
                             grep "^${ENV_VAR_NAME}" .env
-                            sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=latest|" .env
+                            sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=${IMAGE_LATEST_TAG}|" .env
                             echo "  After:"
                             grep "^${ENV_VAR_NAME}" .env
 ENDSSH
@@ -455,9 +496,9 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             set -e
-                            cd ${APPS_DIR}
+                            cd ${TARGET_APPS_DIR}
                             echo "${OCIR_PASS}" | docker login ${REGISTRY} \
                                 -u "${OCIR_USER}" --password-stdin
                             docker compose pull ${CONTAINER_NAME}
@@ -472,9 +513,9 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             set -e
-                            cd ${APPS_DIR}
+                            cd ${TARGET_APPS_DIR}
                             docker compose up -d --no-deps ${CONTAINER_NAME}
                             echo "✓ Container recreated"
 ENDSSH
@@ -488,7 +529,7 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             set -e
                             docker exec ${CONTAINER_NAME} \
                                 /app/bin/mangocms eval "MangoCMS.Release.migrate()"
@@ -502,7 +543,7 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             STATUS=\\$(docker inspect \
                                 --format='{{.State.Status}}' ${CONTAINER_NAME})
 
@@ -514,7 +555,7 @@ ENDSSH
 
                             echo "✓ Container status: \\$STATUS"
                             docker logs ${CONTAINER_NAME} --tail 20
-                            echo "✓ Deployed ${BUILD_TAG} successfully"
+                            echo "✓ Deployed ${IMAGE_TAG} to ${DEPLOY_ENV}"
 ENDSSH
                     '''
                 }
@@ -522,17 +563,19 @@ ENDSSH
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 8: Smoke Test
+        // Stage 11: Smoke Test
         // Hits /health endpoint up to 5 times after deploy
-        // Fails pipeline if app not responding — triggers email alert
         // ─────────────────────────────────────────────────────────────────────
         stage('Smoke Test') {
             when {
-                expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                allOf {
+                    expression { params.PIPELINE_ACTION == 'BUILD_AND_DEPLOY' }
+                    anyOf { branch 'main'; branch 'develop' }
+                }
             }
             steps {
                 sh '''
-                    echo "── Post-deploy smoke test ──"
+                    echo "── Post-deploy smoke test (${DEPLOY_ENV}) ──"
                     sleep 10
 
                     for i in 1 2 3 4 5; do
@@ -543,7 +586,7 @@ ENDSSH
                         echo "  Attempt ${i}: HTTP ${HTTP_STATUS}"
 
                         if [ "$HTTP_STATUS" = "200" ]; then
-                            echo "✓ Smoke test passed"
+                            echo "✓ Smoke test passed — ${APP_URL}"
                             exit 0
                         fi
 
@@ -557,18 +600,16 @@ ENDSSH
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 9: Rollback
-        // Four discrete steps:
-        //   1. Validate tag exists in OCIR (local — safe, never touches server)
-        //   2. Update .env and pull rollback image on server
-        //   3. Recreate container with rollback image
-        //   4. Verify container is healthy and tail logs
-        // Note: migrations are NOT run on rollback — the old image already
-        // ran against the schema it expects.
+        // Stage 12: Rollback
+        // Only available on main and develop branches
+        // Note: migrations are NOT run on rollback
         // ─────────────────────────────────────────────────────────────────────
         stage('Rollback') {
             when {
-                expression { params.PIPELINE_ACTION == 'ROLLBACK' }
+                allOf {
+                    expression { params.PIPELINE_ACTION == 'ROLLBACK' }
+                    anyOf { branch 'main'; branch 'develop' }
+                }
             }
             steps {
                 withCredentials([
@@ -588,7 +629,8 @@ ENDSSH
                         echo "── [1/4] Validating rollback tag ──"
                         if [ -z "${ROLLBACK_TAG}" ]; then
                             echo "✗ ROLLBACK_TAG is required"
-                            echo "  Example: build-13"
+                            echo "  main branch    : build-13"
+                            echo "  develop branch : stg-13"
                             exit 1
                         fi
 
@@ -612,9 +654,9 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             set -e
-                            cd ${APPS_DIR}
+                            cd ${TARGET_APPS_DIR}
                             echo "  Before:"
                             grep "^${ENV_VAR_NAME}" .env
                             sed -i "s|^${ENV_VAR_NAME}=.*|${ENV_VAR_NAME}=${ROLLBACK_TAG}|" .env
@@ -634,9 +676,9 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             set -e
-                            cd ${APPS_DIR}
+                            cd ${TARGET_APPS_DIR}
                             docker compose up -d --no-deps ${CONTAINER_NAME}
                             echo "✓ Container recreated"
 ENDSSH
@@ -650,7 +692,7 @@ ENDSSH
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=30 \
-                            ${PRODUCTION_USER}@${PRODUCTION_HOST} bash << ENDSSH
+                            ${PRODUCTION_USER}@${TARGET_HOST} bash << ENDSSH
                             STATUS=\\$(docker inspect \
                                 --format='{{.State.Status}}' ${CONTAINER_NAME})
 
@@ -662,7 +704,7 @@ ENDSSH
 
                             echo "✓ Container status: \\$STATUS"
                             docker logs ${CONTAINER_NAME} --tail 20
-                            echo "✓ Rollback to ${ROLLBACK_TAG} successful"
+                            echo "✓ Rollback to ${ROLLBACK_TAG} on ${DEPLOY_ENV} successful"
 ENDSSH
                     '''
                 }
@@ -672,18 +714,20 @@ ENDSSH
 
     // ─────────────────────────────────────────────────────────────────────────
     // Post Actions
-    // Always runs regardless of pipeline result
     // ─────────────────────────────────────────────────────────────────────────
     post {
 
         success {
             script {
                 def action = params.PIPELINE_ACTION
+                def env_label = env.DEPLOY_ENV ?: env.BRANCH_NAME
                 def body = action == 'BUILD_AND_DEPLOY' ? """
 ✅ MangoCMS — Build & Deploy Successful
 
 Job       : ${env.JOB_NAME}
-Build     : #${env.BUILD_NUMBER} (${env.BUILD_TAG})
+Branch    : ${env.BRANCH_NAME}
+Env       : ${env_label}
+Build     : #${env.BUILD_NUMBER} (${env.IMAGE_TAG})
 Duration  : ${currentBuild.durationString}
 App URL   : ${env.APP_URL}
 Console   : ${env.BUILD_URL}console
@@ -691,13 +735,15 @@ Console   : ${env.BUILD_URL}console
 ✅ MangoCMS — Rollback Successful
 
 Job       : ${env.JOB_NAME}
+Branch    : ${env.BRANCH_NAME}
+Env       : ${env_label}
 Build     : #${env.BUILD_NUMBER}
 Rolled to : ${params.ROLLBACK_TAG}
 Console   : ${env.BUILD_URL}console
                 """
 
                 emailext(
-                    subject: "✅ MangoCMS ${action} #${env.BUILD_NUMBER} — SUCCESS",
+                    subject: "✅ MangoCMS [${env_label}] ${action} #${env.BUILD_NUMBER} — SUCCESS",
                     body: body,
                     to: 'mytechbytes.official@gmail.com',
                     mimeType: 'text/plain'
@@ -706,44 +752,41 @@ Console   : ${env.BUILD_URL}console
         }
 
         failure {
-            emailext(
-                subject: "❌ MangoCMS ${params.PIPELINE_ACTION} #${env.BUILD_NUMBER} — FAILED",
-                body: """
+            script {
+                def env_label = env.DEPLOY_ENV ?: env.BRANCH_NAME
+                emailext(
+                    subject: "❌ MangoCMS [${env_label}] ${params.PIPELINE_ACTION} #${env.BUILD_NUMBER} — FAILED",
+                    body: """
 ❌ MangoCMS — Pipeline Failed
 
 Job     : ${env.JOB_NAME}
+Branch  : ${env.BRANCH_NAME}
+Env     : ${env_label}
 Build   : #${env.BUILD_NUMBER}
 Action  : ${params.PIPELINE_ACTION}
 Console : ${env.BUILD_URL}console
 
 Check console output for details.
-                """,
-                to: 'mytechbytes.official@gmail.com',
-                mimeType: 'text/plain'
-            )
+                    """,
+                    to: 'mytechbytes.official@gmail.com',
+                    mimeType: 'text/plain'
+                )
+            }
         }
 
         always {
             sh '''
                 echo "── Cleaning up CI infrastructure ──"
 
-                # Stop and remove test postgres container
                 docker stop mangocms-postgres-ci 2>/dev/null || true
                 docker rm   mangocms-postgres-ci 2>/dev/null || true
-
-                # Remove CI Docker network
                 docker network rm mangocms-ci 2>/dev/null || true
-
-                # Clean buildx cache — keep last 5GB to preserve layer cache
                 docker buildx prune -f --reserved-space 5GB || true
 
-                # Remove coverage artifacts — created by Docker root so requires
-                # Docker to delete; fall back to plain rm if container unavailable
                 docker run --rm -v ${WORKSPACE}:/workspace ${CI_IMAGE} \
                     sh -c "rm -rf /workspace/cover" 2>/dev/null \
                     || rm -rf cover/ 2>/dev/null || true
 
-                # Logout from registry
                 docker logout ${REGISTRY} 2>/dev/null || true
             '''
         }
