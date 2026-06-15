@@ -41,3 +41,4 @@ mix.lock
 .elixir-tools/next-ls.log
 .elixir-tools/next-ls.log
 .gitignore
+mix.lock
