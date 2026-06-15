@@ -674,15 +674,200 @@ docker exec cms-stg /app/bin/mangocms eval "MangoCMS.Release.migrate()"
 
 ---
 
-## Part 7 — Adding a New App
+## Part 7 — OCI Email Delivery Setup
+
+### 7.1 Configure Email Domain
+
+OCI Console → **Email Delivery** → **Email Domains** → **Create Email Domain**
+- Domain: `yourdomain.com`
+- Click **Create**
+
+After creation, open the domain and configure:
+
+**SPF** — OCI shows a TXT record to add to your DNS. Add it at your DNS provider:
+```
+Type : TXT
+Name : @  (or yourdomain.com)
+Value: v=spf1 include:rp.oracleemaildelivery.com ~all
+```
+
+**DKIM** — OCI creates a DKIM key. Click the DKIM entry → copy the CNAME record:
+```
+Type  : CNAME
+Name  : <selector>._domainkey   (e.g. mangocms-bom-202606._domainkey)
+Value : <selector>.yourdomain.com.dkim.<region>.oracleemaildelivery.com
+```
+
+After adding both DNS records, OCI verifies them automatically within 5–30 minutes. Status changes to **Active**.
+
+### 7.2 Add Approved Sender
+
+OCI Console → **Email Delivery** → **Approved Senders** → **Create Approved Sender**
+- Email: `no-reply@yourdomain.com`
+- Click **Create**
+
+> **Critical:** The FROM address used in your application must exactly match an approved sender. The Phoenix generator uses `contact@example.com` by default — update it to your actual sender address before deploying.
+
+Wait 10–15 minutes for the approved sender to propagate to OCI's SMTP relay before testing.
+
+### 7.3 Generate SMTP Credentials
+
+SMTP credentials are tied to a specific IAM user. Use the same `jenkins-ci` local IAM user.
+
+OCI Console → **Identity & Security** → **Identity** → **Domains** → Default → **Users** → `jenkins-ci` → **SMTP Credentials** → **Generate SMTP Credentials**
+- Description: `mangocms-smtp`
+- Copy the **username** and **password** immediately — shown only once
+
+The SMTP username format looks like:
+```
+ocid1.user.oc1..xxxxx@ocid1.tenancy.oc1..xxxxx.4r.com
+```
+
+### 7.4 SMTP Connection Details (Mumbai region)
+
+```
+Server : smtp.email.ap-mumbai-1.oci.oraclecloud.com
+Port   : 587  (STARTTLS)
+Auth   : Always
+TLS    : if_available
+```
+
+> **Port 465 vs 587:** OCI Email Delivery uses port 587 with STARTTLS. Using `tls: :always` forces SSL from the first byte (port 465 behaviour) and causes `tls_failed`. Use `tls: :if_available` with port 587.
+
+### 7.5 Add SMTP Vars to Production `.env`
+
+```bash
+cat >> /home/ubuntu/apps/.env << 'EOF'
+
+SMTP_SERVER=smtp.email.ap-mumbai-1.oci.oraclecloud.com
+SMTP_PORT=587
+SMTP_USERNAME=<smtp-username-from-7.3>
+SMTP_PASSWORD=<smtp-password-from-7.3>
+SMTP_FROM=no-reply@yourdomain.com
+EOF
+```
+
+### 7.6 Add SMTP Vars to `docker-compose.yml`
+
+Add these to the `environment:` block of your app service in `docker-compose.yml`:
+
+```yaml
+  cms:
+    environment:
+      # ... existing vars ...
+      SMTP_SERVER: ${SMTP_SERVER}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+```
+
+> **Why explicit?** Docker Compose does not automatically pass all `.env` vars into containers. Only vars listed in `environment:` are injected. Verify with `docker compose config | grep SMTP` — if empty, the service block is missing the env keys.
+
+Restart the app container after editing:
+```bash
+docker compose up -d --no-deps cms
+```
+
+### 7.7 Phoenix App Changes
+
+**`mix.exs`** — add `:ssl` and `:crypto` to `extra_applications`:
+```elixir
+def application do
+  [
+    mod: {MyApp.Application, []},
+    extra_applications: [:logger, :runtime_tools, :ssl, :crypto]
+  ]
+end
+```
+
+> Without `:ssl` in the release, the SMTP TLS handshake silently fails. The error `SSL not started` appears in eval context. The application may start fine but email delivery returns `{:error, ...}` on every send.
+
+**`mix.exs`** — add `gen_smtp` dependency:
+```elixir
+{:swoosh, "~> 1.16"},
+{:gen_smtp, "~> 1.2"},
+```
+
+**`config/runtime.exs`** — optional SMTP config (falls back to no-op if vars absent):
+```elixir
+if System.get_env("SMTP_SERVER") do
+  config :myapp, MyApp.Mailer,
+    adapter: Swoosh.Adapters.SMTP,
+    relay: System.get_env("SMTP_SERVER"),
+    port: String.to_integer(System.get_env("SMTP_PORT") || "587"),
+    username: System.get_env("SMTP_USERNAME"),
+    password: System.get_env("SMTP_PASSWORD"),
+    tls: :if_available,
+    auth: :always,
+    from_email: System.get_env("SMTP_FROM"),
+    tls_options: [verify: :verify_none]
+end
+```
+
+**`lib/myapp/accounts/user_notifier.ex`** — use the SMTP_FROM env var, not the hardcoded Phoenix default:
+```elixir
+# WRONG — default Phoenix generator value, not an approved OCI sender
+|> from({"MyApp", "contact@example.com"})
+
+# CORRECT
+|> from({"MyApp", System.get_env("SMTP_FROM", "no-reply@yourdomain.com")})
+```
+
+**Handle delivery errors in LiveViews** — the default Phoenix generator hard-matches `{:ok, _}` which crashes the LiveView on SMTP failure:
+```elixir
+# WRONG — crashes LiveView if SMTP fails
+{:ok, _} = Accounts.deliver_login_instructions(user, url_fun)
+
+# CORRECT — handle failure gracefully
+case Accounts.deliver_login_instructions(user, url_fun) do
+  {:ok, _} ->
+    {:noreply, socket |> put_flash(:info, "Email sent.") |> push_navigate(to: ~p"/users/log-in")}
+  {:error, _} ->
+    {:noreply, socket |> put_flash(:error, "Could not send email. Please try again later.") |> push_navigate(to: ~p"/users/log-in")}
+end
+```
+
+### 7.8 Test SMTP from Running Container
+
+```bash
+# Test via the running application node (not eval — eval starts a separate minimal VM)
+docker exec cms /app/bin/mangocms rpc "
+  result = MangoCMS.Mailer.deliver(%Swoosh.Email{
+    from: {\"MyApp\", System.get_env(\"SMTP_FROM\")},
+    to: [{\"Test\", \"you@email.com\"}],
+    subject: \"SMTP Test\",
+    text_body: \"OCI SMTP is working.\"
+  })
+  IO.inspect(result, label: \"SMTP Result\")
+"
+# Expected: SMTP Result: {:ok, "Ok\r\n"}
+```
+
+### 7.9 Common SMTP Errors
+
+| Error | Cause | Fix |
+|---|---|---|
+| `SSL not started` | `:ssl` not in `extra_applications` in mix.exs | Add `:ssl, :crypto` to extra_applications, rebuild |
+| `535 Authorization failed: Envelope From address not authorized` | FROM address not an approved sender in OCI | Add sender to Approved Senders in OCI Console — wait 15 min to propagate |
+| `535 Authorization failed` — sender is approved | Approved sender was just created, not propagated yet | Wait 10–15 minutes, retry |
+| `535 Authorization failed` — default Phoenix FROM | `contact@example.com` left unchanged in `user_notifier.ex` | Update `from` to use `SMTP_FROM` env var |
+| `tls_failed` | `tls: :always` forces SSL from first byte, incompatible with STARTTLS on port 587 | Change to `tls: :if_available` |
+| No email, no error log | `{:ok, _} = Mailer.deliver(...)` crashes LiveView, crash is caught upstream | Replace hard match with `case`, handle `{:error, _}` |
+| SMTP vars not reaching container | Vars in `.env` but not listed in `environment:` in docker-compose.yml | Add explicit `SMTP_SERVER: ${SMTP_SERVER}` etc. to service environment block |
+
+---
+
+## Part 8 — Adding a New App
 
 1. **OCI** — Create repository `<appname>` in Container Registry (same compartment)
-2. **DNS** — Add A record pointing new domain to production server IP
-3. **Production server** — Add service to `docker-compose.yml`, add env vars to `.env`, create database:
+2. **OCI Email** — Add approved sender `no-reply@yourdomain.com` (if not already added for domain)
+3. **DNS** — Add A record pointing new domain to production server IP
+4. **Production server** — Add service to `docker-compose.yml`, add env vars to `.env`, create database:
    ```bash
    docker compose exec postgres createdb -U postgres <appname>_prod
    ```
-4. **Caddyfile** — Add block and reload (zero-downtime):
+5. **Caddyfile** — Add block and reload (zero-downtime):
    ```
    appname.yourdomain.com {
        reverse_proxy appname:4000
@@ -691,12 +876,13 @@ docker exec cms-stg /app/bin/mangocms eval "MangoCMS.Release.migrate()"
    ```bash
    docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
    ```
-5. **New app repo** — Copy `Jenkinsfile`, update `IMAGE_NAME` and the branch-specific `CONTAINER_NAME`/`ENV_VAR_NAME`/`APP_URL` values in the Configure stage
-6. **Jenkins** — Create new Multibranch Pipeline job pointing to the new repo
+6. **New app repo** — Copy `Jenkinsfile`, update `IMAGE_NAME` and the branch-specific `CONTAINER_NAME`/`ENV_VAR_NAME`/`APP_URL` values in the Configure stage
+7. **Phoenix app** — Update `user_notifier.ex` FROM address, add `:ssl, :crypto` to extra_applications, add `gen_smtp` dep, add SMTP config to runtime.exs
+8. **Jenkins** — Create new Multibranch Pipeline job pointing to the new repo
 
 ---
 
-## Part 8 — Useful Commands
+## Part 9 — Useful Commands
 
 ```bash
 # Application logs
@@ -719,6 +905,43 @@ docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
 
 ---
 
+## Part 10 — Production Monitoring
+
+### What to Check Regularly
+
+| Check | Command | Expected |
+|---|---|---|
+| Container uptime | `docker ps` | `cms` uptime in days, not minutes |
+| Health endpoint | `curl -s https://cms.yourdomain.com/health` | `{"status":"ok","db":"ok"}` |
+| Container logs | `docker logs --tail 50 cms` | No `[error]` entries |
+| Disk space | `df -h` | `<80%` on `/` |
+| SMTP delivery | RPC test (see Part 7.8) | `{:ok, "Ok\r\n"}` |
+
+### Monthly Tasks
+- **SMTP test** — send a test email via RPC to confirm OCI Email Delivery is live
+- **OCIR cleanup** — prune old `prd-N` images; only keep last 10:
+  ```bash
+  # List images in OCIR — delete old ones via OCI Console or OCI CLI
+  oci artifacts container image list --compartment-id <compartment-ocid> --repository-name mangocms
+  ```
+- **Disk space** — Docker images accumulate; prune unused:
+  ```bash
+  docker image prune -f
+  ```
+
+### Annual Tasks
+- **OCI Auth Token rotation** — tokens expire after 1 year; regenerate for `jenkins-ci` and update Jenkins `ocir-credentials` credential
+- **DKIM key rotation** — OCI allows rotating DKIM keys; update DNS CNAME after rotation
+
+### Key Gotchas to Never Forget
+1. **docker-credential-pass** — if a new Jenkins or production server is set up, remove this binary before running any pipeline. It silently breaks all `docker push` with 403.
+2. **SMTP FROM must be an approved sender** — the Phoenix generator uses `contact@example.com`; always update `user_notifier.ex` before the first email-sending deploy.
+3. **`eval` vs `rpc`** — `eval` starts a minimal VM (only kernel/stdlib). Use `rpc` to run code in the context of the live running Phoenix node. SSL, config, and env vars are only available via `rpc`.
+4. **OCIR repos must be pre-created** — first push fails if the repo doesn't exist in OCI Console.
+5. **Approved sender propagation** — after creating an approved sender in OCI, wait 10–15 minutes before testing SMTP; 535 errors during this window are normal.
+
+---
+
 ## Common Issues & Fixes
 
 | Issue | Cause | Fix |
@@ -736,3 +959,10 @@ docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
 | `BRANCH_NAME` empty in pipeline | Regular Pipeline job, not Multibranch | Convert job to Multibranch Pipeline |
 | 502 Bad Gateway from Caddy | Caddy not on same Docker network as app containers | Add `networks: - frontend-net` to Caddy service in docker-compose.yml |
 | Smoke test HTTP 000 | Container not running or Caddy not started | Check `docker compose ps`, check Caddy logs |
+| `SSL not started` on SMTP | `:ssl` missing from `extra_applications` in mix.exs | Add `:ssl, :crypto`, rebuild release |
+| `535 Authorization failed: Envelope From not authorized` | FROM address not an approved sender, or sender not propagated yet | Add sender in OCI → Approved Senders, wait 15 min |
+| `535` with default Phoenix FROM | `contact@example.com` left in `user_notifier.ex` | Change to `System.get_env("SMTP_FROM", "no-reply@yourdomain.com")` |
+| `tls_failed` on SMTP | `tls: :always` incompatible with STARTTLS on port 587 | Change to `tls: :if_available` in runtime.exs |
+| SMTP vars not reaching container | Vars in `.env` but not listed in `environment:` in docker-compose.yml | Add explicit `SMTP_SERVER: ${SMTP_SERVER}` etc. to service block |
+| LiveView crashes on registration | `{:ok, _} = Mailer.deliver(...)` hard-match crashes on SMTP error | Replace with `case` statement, handle `{:error, _}` |
+| `docker compose config \| grep SMTP` returns nothing | App service missing SMTP env keys | Add vars to `environment:` block and restart container |
